@@ -1,0 +1,2202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EduScan - Realtime Dynamic QR Attendance</title>
+  
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- HTML5 QR Code Scanner -->
+  <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+  <!-- Reliable QRCode.js Engine -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+  <style>
+    @keyframes pulse-fast {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    .animate-pulse-fast { animation: pulse-fast 1s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+    @media print {
+      body * { visibility: hidden; }
+      #printable-report-area, #printable-report-area * { visibility: visible; }
+      #printable-report-area { position: absolute; left: 0; top: 0; width: 100%; }
+      .no-print { display: none !important; }
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans antialiased min-h-screen flex flex-col">
+
+  <div id="toast-container" class="fixed top-4 right-4 z-[9999] flex flex-col gap-2 pointer-events-none no-print"></div>
+
+  <header class="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-xs no-print">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="flex justify-between items-center h-16">
+        <div class="flex items-center space-x-3">
+          <div class="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-md">
+            <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6-1v2M6 4v2M4 8h16M4 16h16M6 20v-2m12 2v-2m-6 2v-1M8 12h8" /></svg>
+          </div>
+          <div>
+            <div class="flex items-center gap-2">
+              <h1 class="font-bold text-lg text-slate-900 leading-tight">EduScan</h1>
+              <span id="cloud-status-badge" class="px-2 py-0.5 text-[10px] font-bold bg-amber-100 text-amber-800 rounded-full flex items-center gap-1">
+                <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse-fast"></span>Connecting Cloud...
+              </span>
+            </div>
+            <p class="text-xs text-slate-500 font-medium">Cloud Attendance System</p>
+          </div>
+        </div>
+        <nav class="hidden md:flex space-x-1" id="desktop-nav-slot"></nav>
+        <div id="auth-header-slot"></div>
+      </div>
+    </div>
+    <div class="md:hidden flex overflow-x-auto border-t border-slate-200 px-2 py-1.5 space-x-1 scrollbar-none" id="mobile-nav-slot"></div>
+  </header>
+
+  <main class="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8" id="main-content">
+    <div class="text-center mt-20 text-slate-500">Loading Workspace...</div>
+  </main>
+
+  <div id="modal-container" class="no-print"></div>
+  <div id="bulk-action-bar" class="fixed bottom-0 inset-x-0 bg-white border-t shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)] p-4 transform translate-y-full transition-transform duration-300 z-40 hidden flex justify-between items-center max-w-7xl mx-auto no-print"></div>
+
+  <!-- CONSOLIDATED REALTIME CLOUD ENGINE -->
+  <script type="module">
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js';
+    import { getDatabase, ref, onValue, set } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-database.js';
+
+    const DEPARTMENTS = ['First Year (FE)', 'Computer Science', 'Information Tech', 'Electronics Eng', 'Mechanical Eng', 'Civil Eng', 'Management'];
+    const YEARS = ['FE', 'SE', 'TE', 'BE'];
+    const DEPT_DIVISIONS = ['A', 'B', 'C', 'D'];
+    const FE_DIVISIONS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'];
+
+    const DEFAULT_USERS = [
+      { id: 'usr_admin', username: 'admin', password: 'admin123', name: 'System Administrator', role: 'ADMIN' },
+      { id: 'usr_hod', username: 'hod_cs', password: 'hod123', name: 'Dr. HOD CS', role: 'HOD' },
+      { id: 'usr_fac', username: 'prof_smith', password: 'smith123', name: 'Prof. Smith', role: 'FACULTY' },
+      { id: 'usr_view', username: 'viewer', password: 'view123', name: 'Observer Officer', role: 'VIEW_ONLY' }
+    ];
+
+    function getStoredFallback() {
+      const keys = ['eduscan_cache_state', 'appStateFinalQR', 'eduscan_state', 'appState'];
+      for (let k of keys) {
+        let raw = localStorage.getItem(k);
+        if (raw) {
+          try {
+            let parsed = JSON.parse(raw);
+            if (parsed && (parsed.students?.length || parsed.lectures?.length)) return parsed;
+          } catch(e){}
+        }
+      }
+      return null;
+    }
+
+    const fallbackData = getStoredFallback();
+
+    window.state = {
+      students: fallbackData?.students || [],
+      users: fallbackData?.users?.length ? fallbackData.users : DEFAULT_USERS,
+      lectures: fallbackData?.lectures || [],
+      attendance: fallbackData?.attendance || [],
+      coordinators: fallbackData?.coordinators || [],
+      usedQrTokens: fallbackData?.usedQrTokens || [],
+      currentUser: JSON.parse(localStorage.getItem('eduscan_session')) || null,
+      activeTab: 'lectures'
+    };
+
+    window.selectedStudents = new Set();
+    window.currentReportType = 'Theory';
+    window.currentActiveLectureId = null;
+    let qrRefreshInterval = null, html5QrCode = null, isScanningPaused = false;
+    let database = null, stateRef = null;
+
+    try {
+      const app = initializeApp({
+        apiKey: 'AIzaSyCBWbzAn4-n1pD9RAgZkD-djb4-5VmP9mU',
+        authDomain: 'attengo-e1c2c.firebaseapp.com',
+        projectId: 'attengo-e1c2c',
+        databaseURL: 'https://attengo-e1c2c-default-rtdb.asia-southeast1.firebasedatabase.app',
+        storageBucket: 'attengo-e1c2c.firebasestorage.app'
+      });
+      database = getDatabase(app);
+      stateRef = ref(database, 'appStateFinalQR');
+
+      onValue(stateRef, (snapshot) => {
+        const cloudData = snapshot.val();
+        if (cloudData) {
+          if (cloudData.students?.length) window.state.students = cloudData.students;
+          if (cloudData.users?.length) window.state.users = cloudData.users;
+          if (cloudData.lectures?.length) window.state.lectures = cloudData.lectures;
+          if (cloudData.attendance?.length) window.state.attendance = cloudData.attendance;
+          if (cloudData.coordinators?.length) window.state.coordinators = cloudData.coordinators;
+          if (cloudData.usedQrTokens?.length) window.state.usedQrTokens = cloudData.usedQrTokens;
+
+          localStorage.setItem('eduscan_cache_state', JSON.stringify({
+            students: window.state.students,
+            users: window.state.users,
+            lectures: window.state.lectures,
+            attendance: window.state.attendance,
+            coordinators: window.state.coordinators,
+            usedQrTokens: window.state.usedQrTokens
+          }));
+        } else if (window.state.students.length > 0) {
+          window.saveStateLocalAndCloud();
+        }
+
+        window.setCloudStatus('Cloud Sync: Active', true);
+
+        if (window.currentActiveLectureId && document.getElementById('lecture-scan-count-badge')) {
+          window.updateLiveLectureView();
+        } else if (document.getElementById('student-portal-wrapper')) {
+          window.updateStudentPortalStats();
+        } else if (window.state.activeTab === 'students' && document.getElementById('student-grid-container')) {
+          window.filterStudentsList();
+        } else if (window.state.activeTab === 'reports' && document.getElementById('report-table-container')) {
+          window.generateReportTable();
+        } else if (window.state.activeTab === 'lectures' && document.getElementById('lecture-grid-container')) {
+          window.filterLecturesList();
+        } else {
+          window.renderMainContent();
+        }
+      }, (err) => {
+        window.setCloudStatus('Offline (Local)', false);
+        if (!window.currentActiveLectureId) window.renderMainContent();
+      });
+
+    } catch (e) {
+      window.setCloudStatus('Offline (Local)', false);
+      window.renderMainContent();
+    }
+
+    window.saveStateLocalAndCloud = async function() {
+      if (window.state.currentUser) localStorage.setItem('eduscan_session', JSON.stringify(window.state.currentUser));
+      else localStorage.removeItem('eduscan_session');
+
+      const dataSnapshot = {
+        students: window.state.students,
+        users: window.state.users,
+        lectures: window.state.lectures,
+        attendance: window.state.attendance,
+        coordinators: window.state.coordinators,
+        usedQrTokens: (window.state.usedQrTokens || []).slice(-500)
+      };
+
+      localStorage.setItem('eduscan_cache_state', JSON.stringify(dataSnapshot));
+
+      if (database && stateRef) {
+        try {
+          await set(stateRef, JSON.parse(JSON.stringify(dataSnapshot)));
+          window.setCloudStatus('Cloud Sync: Active', true);
+        } catch(e) {
+          window.setCloudStatus('Offline (Local)', false);
+        }
+      }
+    };
+
+    window.getDivisionsForYear = function(year) {
+      return year === 'FE' ? FE_DIVISIONS : DEPT_DIVISIONS;
+    };
+
+    window.setCloudStatus = function(message, isOnline) {
+      const badge = document.getElementById('cloud-status-badge');
+      if (!badge) return;
+      badge.className = `px-2 py-0.5 text-[10px] font-bold rounded-full flex items-center gap-1 ${isOnline ? 'bg-teal-100 text-teal-800' : 'bg-rose-100 text-rose-800'}`;
+      badge.innerHTML = `<span class="w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-teal-500 animate-pulse-fast' : 'bg-rose-500'}"></span>${message}`;
+    };
+
+    window.showToast = function(message, type = 'success') {
+      const container = document.getElementById('toast-container');
+      const toast = document.createElement('div');
+      toast.className = `flex items-center px-4 py-3 rounded-xl shadow-lg border text-sm font-bold z-50 ${type === 'success' ? 'bg-teal-600 text-white' : type === 'error' ? 'bg-rose-600 text-white' : 'bg-indigo-600 text-white'}`;
+      toast.innerHTML = `<span class="mr-2">${type === 'success' ? '✓' : type === 'error' ? '✕' : 'ℹ'}</span> ${message}`;
+      container.appendChild(toast);
+      setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 3000);
+    };
+
+    window.getModalContainer = function() {
+      let c = document.getElementById('modal-container');
+      if (!c) { c = document.createElement('div'); c.id = 'modal-container'; document.body.appendChild(c); }
+      return c;
+    };
+
+    window.closeModal = function() {
+      const c = document.getElementById('modal-container');
+      if (c) c.innerHTML = '';
+    };
+
+    window.cleanupHardware = function() {
+      if (qrRefreshInterval) clearInterval(qrRefreshInterval);
+      if (html5QrCode && html5QrCode.isScanning) {
+        html5QrCode.stop().then(() => html5QrCode.clear()).catch(e => console.error(e));
+      }
+      isScanningPaused = false;
+      window.currentActiveLectureId = null;
+    };
+
+    window.switchTab = function(tab) {
+      window.cleanupHardware();
+      if (!window.state.currentUser) { window.openLoginModal(); return; }
+      window.state.activeTab = tab;
+      window.selectedStudents.clear();
+      window.updateBulkActionBar();
+      window.renderMainContent();
+    };
+
+    window.renderNavigation = function() {
+      const desktopNav = document.getElementById('desktop-nav-slot');
+      const mobileNav = document.getElementById('mobile-nav-slot');
+      if (!window.state.currentUser) { desktopNav.innerHTML = `<span class="text-xs text-slate-400 font-semibold">🔒 Log in required</span>`; mobileNav.innerHTML = ``; return; }
+
+      if (window.state.currentUser.role === 'STUDENT') {
+        desktopNav.innerHTML = `<button onclick="window.switchTab('portal')" class="px-3 py-2 bg-indigo-50 text-indigo-700 rounded-lg text-sm font-bold">📊 My Portal</button>`;
+        mobileNav.innerHTML = `<button onclick="window.switchTab('portal')" class="px-3 py-1.5 bg-indigo-600 text-white rounded-md text-xs font-semibold">My Portal</button>`;
+        return;
+      }
+
+      const isAdminOrHod = (window.state.currentUser.role === 'ADMIN' || window.state.currentUser.role === 'HOD');
+
+      const tabs = [
+        { id: 'lectures', icon: '📖', label: 'Lectures' },
+        { id: 'students', icon: '👨‍🎓', label: 'Students' },
+        { id: 'reports', icon: '📈', label: 'Reports' },
+        ...(isAdminOrHod ? [{ id: 'coordinators', icon: '🎓', label: 'Coordinators' }] : []),
+        { id: 'settings', icon: '⚙️', label: 'Settings' }
+      ];
+      desktopNav.innerHTML = tabs.map(t => `<button onclick="window.switchTab('${t.id}')" class="px-3 py-2 rounded-lg text-sm font-medium ${window.state.activeTab === t.id ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600'}">${t.icon} ${t.label}</button>`).join('');
+      mobileNav.innerHTML = tabs.map(t => `<button onclick="window.switchTab('${t.id}')" class="px-3 py-1.5 rounded-md text-xs font-medium text-slate-600 ${window.state.activeTab === t.id ? 'bg-indigo-100 text-indigo-800' : ''}">${t.label}</button>`).join('');
+    };
+
+    window.renderAuthHeader = function() {
+      const slot = document.getElementById('auth-header-slot');
+      if (window.state.currentUser) {
+        const coordAssignment = window.state.coordinators.find(c => c.username === window.state.currentUser.username);
+        const coordTag = coordAssignment ? `<span class="px-1.5 py-0.5 text-[9px] font-bold rounded bg-purple-100 text-purple-800">Coordinator (${coordAssignment.year}-${coordAssignment.division})</span>` : '';
+
+        slot.innerHTML = `<div class="flex items-center gap-3"><div class="text-right hidden sm:block"><p class="text-xs font-semibold text-slate-900">${window.state.currentUser.name}</p><div class="flex items-center gap-1 justify-end">${coordTag}<span class="px-1.5 py-0.5 text-[10px] font-bold rounded bg-slate-100">${window.state.currentUser.role}</span></div></div><button onclick="window.handleLogout()" class="px-3 py-1.5 bg-rose-50 text-rose-600 rounded-lg text-xs font-bold hover:bg-rose-100">Logout</button></div>`;
+      } else {
+        slot.innerHTML = `<button onclick="window.openLoginModal()" class="px-4 py-2 bg-slate-900 text-white rounded-xl text-sm font-medium">Log In</button>`;
+      }
+    };
+
+    window.handleLogout = function() {
+      window.cleanupHardware();
+      window.state.currentUser = null;
+      localStorage.removeItem('eduscan_session');
+      window.openLoginModal();
+      window.renderNavigation();
+      window.renderAuthHeader();
+    };
+
+    window.renderMainContent = function() {
+      window.renderNavigation();
+      window.renderAuthHeader();
+      const main = document.getElementById('main-content');
+      if (!window.state.currentUser) { main.innerHTML = `<div class="text-center mt-20"><h2 class="text-2xl font-bold text-slate-900">EduScan</h2><button onclick="window.openLoginModal()" class="mt-4 px-6 py-2 bg-indigo-600 text-white rounded-xl font-bold shadow-md">Open Login Portal</button></div>`; return; }
+      if (window.state.currentUser.role === 'STUDENT') { window.renderStudentPortalView(main); return; }
+      switch (window.state.activeTab) {
+        case 'lectures': window.renderLecturesView(main); break;
+        case 'students': window.renderStudentsView(main); break;
+        case 'reports': window.renderReportsView(main); break;
+        case 'coordinators': window.renderCoordinatorsView(main); break;
+        case 'settings': window.renderSettingsView(main); break;
+        default: window.renderLecturesView(main);
+      }
+    };
+
+    window.updateDivOptionsForYear = function(yearSelectId, divSelectId) {
+      const yr = document.getElementById(yearSelectId).value;
+      const divSelect = document.getElementById(divSelectId);
+      if(!divSelect) return;
+      const divs = window.getDivisionsForYear(yr);
+      divSelect.innerHTML = divs.map(d => `<option value="${d}">Div ${d}</option>`).join('');
+    };
+
+    window.updateBatchOptions = function(divSelectId, batchSelectId, includeNoChange = false) {
+      const div = document.getElementById(divSelectId).value;
+      const batchSelect = document.getElementById(batchSelectId);
+      if(!batchSelect) return;
+      let opts = includeNoChange ? `<option value="">-- No Change --</option>` : '';
+      if(div) {
+        opts += `<option value="Full">Full Division</option>
+                 <option value="${div}1">${div}1</option>
+                 <option value="${div}2">${div}2</option>
+                 <option value="${div}3">${div}3</option>`;
+      } else {
+        opts += `<option value="Full">Full Division</option>`;
+      }
+      batchSelect.innerHTML = opts;
+    };
+
+    window.computeStudentStats = function(moodleId) {
+      const s = window.state.students.find(x => String(x.moodleId) === String(moodleId));
+      if(!s) return { attended: 0, total: 0, pct: 100, statusBadge: '' };
+      const relLecs = window.state.lectures.filter(l => l.year === s.year && l.division === s.division && (l.batch === 'Full' || l.batch === s.batch));
+      const total = relLecs.length;
+      if(total === 0) return { attended: 0, total: 0, pct: 100, statusBadge: '<span class="px-2.5 py-1 text-xs font-bold rounded-full bg-slate-100 text-slate-700">No Sessions</span>' };
+      const relIds = relLecs.map(l => l.id);
+      const attended = window.state.attendance.filter(a => String(a.moodleId) === String(moodleId) && relIds.includes(a.lectureId)).length;
+      const pct = Math.min(100, Math.round((attended / total) * 100));
+
+      let statusBadge = '';
+      if (pct >= 75) {
+        statusBadge = '<span class="px-2.5 py-1 text-xs font-extrabold rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300">🟢 Safe (Eligible)</span>';
+      } else if (pct >= 60) {
+        statusBadge = '<span class="px-2.5 py-1 text-xs font-extrabold rounded-full bg-amber-100 text-amber-800 border border-amber-300">🟡 Warning (Borderline)</span>';
+      } else {
+        statusBadge = '<span class="px-2.5 py-1 text-xs font-extrabold rounded-full bg-rose-100 text-rose-800 border border-rose-300">🔴 Defaulter</span>';
+      }
+      return { attended, total, pct, statusBadge };
+    };
+
+    // --- 1. LECTURES & QR DISPLAY ---
+    window.renderLecturesView = function(c) {
+      const isViewOnly = window.state.currentUser.role === 'VIEW_ONLY';
+      const isFaculty = window.state.currentUser.role === 'FACULTY';
+
+      c.innerHTML = `
+        <div class="space-y-6">
+          <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-white p-6 rounded-2xl border shadow-xs">
+            <div><h2 class="text-2xl font-bold text-slate-900">Lecture Sessions</h2><p class="text-slate-500 text-sm">Create lectures/labs and display dynamic live QR codes.</p></div>
+            <div class="flex flex-wrap gap-2">
+              ${isFaculty ? `<button onclick="window.exportSubjectTeacherCSV()" class="px-4 py-2.5 bg-teal-600 text-white font-bold rounded-xl text-sm shadow-sm flex items-center gap-1">📊 Export My Subject CSV</button>` : ''}
+              ${!isViewOnly ? `<button onclick="window.openCreateLectureModal()" class="px-5 py-2.5 bg-indigo-600 text-white font-semibold rounded-xl text-sm">+ Create Lecture/Lab</button>` : `<span class="px-3 py-1 bg-slate-100 text-slate-600 font-bold text-xs rounded-lg">View Only Mode</span>`}
+            </div>
+          </div>
+
+          <div class="bg-white p-4 rounded-2xl border shadow-xs grid grid-cols-1 sm:grid-cols-4 gap-3">
+            <input id="lec-filter-search" type="text" oninput="window.filterLecturesList()" placeholder="Search Subject / Faculty / Time..." class="px-3 py-2 bg-slate-50 border rounded-xl text-xs" />
+            <select id="lec-filter-dept" onchange="window.filterLecturesList()" class="px-3 py-2 bg-slate-50 border rounded-xl text-xs">
+              <option value="">All Departments</option>
+              ${DEPARTMENTS.map(d => `<option value="${d}">${d}</option>`).join('')}
+            </select>
+            <select id="lec-filter-year" onchange="window.filterLecturesList(); window.updateDivOptionsForYear('lec-filter-year', 'lec-filter-div');" class="px-3 py-2 bg-slate-50 border rounded-xl text-xs">
+              <option value="">All Years</option>
+              ${YEARS.map(y => `<option value="${y}">${y}</option>`).join('')}
+            </select>
+            <select id="lec-filter-div" onchange="window.filterLecturesList()" class="px-3 py-2 bg-slate-50 border rounded-xl text-xs">
+              <option value="">All Divisions</option>
+              ${FE_DIVISIONS.map(d => `<option value="${d}">Division ${d}</option>`).join('')}
+            </select>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" id="lecture-grid-container"></div>
+        </div>
+      `;
+      window.filterLecturesList();
+    };
+
+    window.exportSubjectTeacherCSV = function() {
+      const myUsername = window.state.currentUser.username;
+      const myLectures = window.state.lectures.filter(l => l.facultyUsername === myUsername);
+      if(myLectures.length === 0) return window.showToast("No lectures found created by you.", "error");
+
+      const subjectName = myLectures[0].subject;
+      let csv = `Attendance Export for Subject: ${subjectName} (Faculty: ${window.state.currentUser.name})\n`;
+      csv += "Roll No,Moodle ID,Name,Department,Year,Division,Batch,Total Conducted,Attended,Percentage\n";
+
+      window.state.students.forEach(s => {
+        const relLecs = myLectures.filter(l => l.year === s.year && l.division === s.division && (l.batch === 'Full' || l.batch === s.batch));
+        if(relLecs.length > 0) {
+          const lecIds = relLecs.map(l => l.id);
+          const atts = window.state.attendance.filter(a => String(a.moodleId) === String(s.moodleId) && lecIds.includes(a.lectureId)).length;
+          const pct = Math.min(100, Math.round((atts / relLecs.length) * 100));
+          csv += `"${s.rollNo || ''}","${s.moodleId}","${s.name}","${s.department}","${s.year}","${s.division}","${s.batch}",${relLecs.length},${atts},${pct}%\n`;
+        }
+      });
+
+      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+      a.download = `${subjectName}_Subject_Attendance.csv`; a.click();
+    };
+
+    window.filterLecturesList = function() {
+      const search = (document.getElementById('lec-filter-search')?.value || '').toLowerCase();
+      const dept = document.getElementById('lec-filter-dept')?.value || '';
+      const year = document.getElementById('lec-filter-year')?.value || '';
+      const div = document.getElementById('lec-filter-div')?.value || '';
+
+      const grid = document.getElementById('lecture-grid-container');
+      if (!grid) return;
+
+      let baseLectures = window.state.lectures;
+      if (window.state.currentUser.role === 'FACULTY') {
+        baseLectures = window.state.lectures.filter(l => l.facultyUsername === window.state.currentUser.username);
+      }
+
+      const filtered = baseLectures.filter(l => {
+        const matchesSearch = l.subject.toLowerCase().includes(search) || l.facultyName.toLowerCase().includes(search) || (l.time && l.time.includes(search));
+        const matchesDept = !dept || l.department === dept;
+        const matchesYear = !year || l.year === year;
+        const matchesDiv = !div || l.division === div;
+        return matchesSearch && matchesDept && matchesYear && matchesDiv;
+      });
+
+      const isViewOnly = window.state.currentUser.role === 'VIEW_ONLY';
+
+      grid.innerHTML = filtered.map(l => {
+        const attendedCount = window.state.attendance.filter(a => a.lectureId === l.id).length;
+        const enrolledStudents = window.state.students.filter(s => s.year === l.year && s.division === l.division && (l.batch === 'Full' || s.batch === l.batch));
+        const enrolledCount = enrolledStudents.length;
+        const pct = enrolledCount > 0 ? Math.round((attendedCount / enrolledCount) * 100) : 0;
+        const sessionType = l.sessionType || 'Theory';
+
+        return `
+          <div class="bg-white p-5 rounded-2xl border border-indigo-100 shadow-xs flex flex-col justify-between">
+            <div>
+              <div class="flex justify-between items-start gap-2">
+                <div>
+                  <span class="px-2 py-0.5 text-[9px] font-extrabold uppercase rounded ${sessionType === 'Lab' ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-800'} mb-1 inline-block">
+                    ${sessionType === 'Lab' ? 'Practical (Lab)' : 'Theory (Lecture)'}
+                  </span>
+                  <h4 class="font-bold text-lg leading-tight">${l.subject}</h4>
+                </div>
+                <span class="px-2 py-1 text-[11px] font-extrabold rounded-lg ${pct >= 75 ? 'bg-teal-100 text-teal-800' : 'bg-rose-100 text-rose-800'} whitespace-nowrap">
+                  ${pct}%
+                </span>
+              </div>
+              <p class="text-xs text-slate-500 mb-1 mt-1">${l.year} - Div ${l.division} - Batch: ${l.batch}</p>
+              <p class="text-[10px] text-slate-400 mb-1">📅 ${l.date} ${l.time ? '&bull; ⏰ ' + l.time : ''}</p>
+              <p class="text-[10px] text-slate-400 mb-3">👨‍🏫 ${l.facultyName}</p>
+              
+              <p class="text-xs font-bold text-slate-700">
+                Attended: <span class="text-teal-600 font-extrabold">${attendedCount}/${enrolledCount}</span> <span class="text-slate-400 font-normal">(${pct}%)</span>
+              </p>
+            </div>
+            <div class="mt-4 pt-3 border-t border-slate-100 flex gap-2">
+              <button onclick="window.launchFacultyQRDisplay('${l.id}')" class="flex-1 py-2 bg-indigo-600 text-white font-bold text-xs rounded-lg">${isViewOnly ? 'View Session' : 'Launch QR Scan'}</button>
+              ${!isViewOnly ? `<button onclick="window.deleteLecture('${l.id}')" class="py-2 px-3 bg-rose-50 text-rose-600 rounded-lg">🗑️</button>` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      if (filtered.length === 0) {
+        grid.innerHTML = '<div class="col-span-full text-center p-6 text-slate-400">No matching sessions found.</div>';
+      }
+    };
+
+    window.openCreateLectureModal = function() {
+      if(window.state.currentUser.role === 'VIEW_ONLY') return window.showToast("View Only users cannot create lectures.", "error");
+      const c = window.getModalContainer();
+      const today = new Date().toISOString().split('T')[0];
+      const nowTime = new Date().toTimeString().slice(0, 5);
+
+      c.innerHTML = `
+        <div class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div class="bg-white rounded-2xl max-w-md w-full p-6 space-y-4">
+            <h3 class="font-bold text-lg">New Academic Session</h3>
+            <form onsubmit="window.handleCreateLecture(event)" class="space-y-3">
+              <div>
+                <label class="block text-[10px] font-bold text-slate-500 mb-0.5">Session Type</label>
+                <select id="lec-session-type" class="w-full px-3 py-2 border rounded-xl text-sm font-semibold bg-indigo-50 text-indigo-900 border-indigo-200">
+                  <option value="Theory" selected>Lecture (Theory)</option>
+                  <option value="Lab">Lab (Practical)</option>
+                </select>
+              </div>
+              <input id="lec-subject" type="text" placeholder="Subject Name (e.g. ADSA / DBMSA)" required class="w-full px-3 py-2 border rounded-xl text-sm" />
+              <select id="lec-dept" class="w-full px-3 py-2 border rounded-xl text-sm">${DEPARTMENTS.map(d => `<option value="${d}">${d}</option>`).join('')}</select>
+              <div class="grid grid-cols-3 gap-2">
+                <select id="lec-year" onchange="window.updateDivOptionsForYear('lec-year', 'lec-div'); window.updateBatchOptions('lec-div', 'lec-batch');" class="w-full px-3 py-2 border rounded-xl text-sm">${YEARS.map(y => `<option value="${y}">${y}</option>`).join('')}</select>
+                <select id="lec-div" onchange="window.updateBatchOptions('lec-div', 'lec-batch')" class="w-full px-3 py-2 border rounded-xl text-sm font-bold text-indigo-900 bg-indigo-50"></select>
+                <select id="lec-batch" class="w-full px-3 py-2 border rounded-xl text-sm"></select>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-[10px] font-bold text-slate-500 mb-0.5">Session Date</label>
+                  <input id="lec-date" type="date" value="${today}" required class="w-full px-3 py-2 border rounded-xl text-xs" />
+                </div>
+                <div>
+                  <label class="block text-[10px] font-bold text-slate-500 mb-0.5">Start Time</label>
+                  <input id="lec-time" type="time" value="${nowTime}" required class="w-full px-3 py-2 border rounded-xl text-xs" />
+                </div>
+              </div>
+              <div class="flex gap-2 justify-end pt-3">
+                <button type="button" onclick="window.closeModal()" class="px-4 py-2 bg-slate-100 rounded-xl text-sm font-bold">Cancel</button>
+                <button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold">Create</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+      window.updateDivOptionsForYear('lec-year', 'lec-div');
+      window.updateBatchOptions('lec-div', 'lec-batch');
+    };
+
+    window.handleCreateLecture = function(e) {
+      e.preventDefault();
+      const subject = document.getElementById('lec-subject').value.trim();
+      const year = document.getElementById('lec-year').value;
+      const division = document.getElementById('lec-div').value;
+      const batch = document.getElementById('lec-batch').value;
+      const date = document.getElementById('lec-date').value;
+      const time = document.getElementById('lec-time').value;
+
+      const existing = window.state.lectures.find(l => l.subject.toLowerCase() === subject.toLowerCase() && l.year === year && l.division === division && l.batch === batch && l.date === date && l.time === time);
+      if(existing) {
+        return window.showToast("Warning: A session for this subject, date & time already exists!", "error");
+      }
+
+      window.state.lectures.unshift({ 
+        id: `lec_${Date.now()}`, 
+        sessionType: document.getElementById('lec-session-type').value,
+        subject, 
+        department: document.getElementById('lec-dept').value, 
+        year, 
+        division, 
+        batch, 
+        date,
+        time,
+        facultyUsername: window.state.currentUser.username, 
+        facultyName: window.state.currentUser.name 
+      });
+
+      window.saveStateLocalAndCloud(); window.closeModal(); window.switchTab('lectures'); window.showToast("Session created successfully!");
+    };
+
+    window.deleteLecture = function(id) {
+      const lecture = window.state.lectures.find(l => l.id === id);
+      if(window.state.currentUser.role === 'VIEW_ONLY') return window.showToast("View Only users cannot delete sessions.", "error");
+      if(window.state.currentUser.role === 'FACULTY' && lecture && lecture.facultyUsername !== window.state.currentUser.username) {
+        return window.showToast("You can only delete your own sessions.", "error");
+      }
+
+      if(confirm("Delete this session and all its attendance records?")) {
+        window.state.lectures = window.state.lectures.filter(l => l.id !== id);
+        window.state.attendance = window.state.attendance.filter(a => a.lectureId !== id);
+        window.saveStateLocalAndCloud(); window.switchTab('lectures');
+      }
+    };
+
+    // --- QR DISPLAY ---
+    window.launchFacultyQRDisplay = function(lectureId) {
+      window.currentActiveLectureId = lectureId;
+      const lecture = window.state.lectures.find(l => l.id === lectureId);
+      const c = document.getElementById('main-content');
+      const isViewOnly = window.state.currentUser.role === 'VIEW_ONLY';
+
+      c.innerHTML = `
+        <div class="max-w-5xl mx-auto space-y-6">
+          <div class="bg-white p-4 rounded-2xl border flex justify-between items-center shadow-xs">
+            <div>
+              <button onclick="window.currentActiveLectureId = null; window.switchTab('lectures')" class="text-xs text-indigo-600 font-bold mb-1">← Back</button>
+              <h2 class="text-xl font-bold">${lecture.subject} <span class="text-xs font-semibold px-2 py-0.5 rounded ${lecture.sessionType === 'Lab' ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-800'}">${lecture.sessionType || 'Theory'}</span> <span class="text-sm font-normal text-slate-500">(${lecture.year}-${lecture.division}-${lecture.batch})</span></h2>
+            </div>
+            <div id="lecture-scan-count-badge" class="px-4 py-2 bg-teal-100 text-teal-800 font-bold rounded-xl text-sm">Present: 0</div>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="bg-white p-8 rounded-2xl border shadow-lg flex flex-col items-center justify-center">
+              <h3 class="font-bold text-slate-800 mb-6">Scan from Student App</h3>
+              <div class="p-4 bg-white border-4 border-slate-100 rounded-3xl shadow-sm relative flex items-center justify-center w-[290px] h-[290px]">
+                <div id="qr-target-box" class="flex items-center justify-center w-[250px] h-[250px]"></div>
+                <div class="absolute bottom-0 left-0 h-1.5 bg-indigo-500 rounded-b-3xl" id="qr-timer-bar" style="width: 100%"></div>
+              </div>
+            </div>
+            <div class="bg-white p-6 rounded-2xl border flex flex-col h-[450px]">
+              <h3 class="font-bold text-slate-800 border-b pb-2 mb-2">Live Attendance Feed</h3>
+              <div id="live-attendance-list" class="flex-1 overflow-y-auto space-y-2 mb-4"></div>
+              ${!isViewOnly ? `
+              <div class="pt-4 border-t border-slate-200">
+                <p class="text-xs font-bold text-slate-600 mb-2">Manual Override</p>
+                <div class="flex gap-2">
+                  <input id="manual-moodle-id" type="text" placeholder="Enter Moodle ID" class="flex-1 px-3 py-2 border rounded-xl text-sm font-mono">
+                  <button onclick="window.handleManualFacultyEntry('${lecture.id}')" class="px-4 py-2 bg-slate-800 text-white text-sm font-bold rounded-xl">Add</button>
+                </div>
+              </div>
+              ` : ''}
+            </div>
+          </div>
+        </div>
+      `;
+
+      let qrcodeInstance = null;
+
+      function renderLiveQR() {
+        if(!window.currentActiveLectureId || window.state.activeTab !== 'lectures') return;
+        const box = document.getElementById("qr-target-box");
+        if (!box) return;
+
+        const nonce = Math.random().toString(36).substring(2, 8);
+        const payload = `${lecture.id}|${Date.now()}|${nonce}`;
+
+        try {
+          if (!qrcodeInstance) {
+            box.innerHTML = "";
+            qrcodeInstance = new QRCode(box, {
+              text: payload,
+              width: 250,
+              height: 250,
+              colorDark: "#0f172a",
+              colorLight: "#ffffff",
+              correctLevel: QRCode.CorrectLevel.M
+            });
+          } else {
+            qrcodeInstance.clear();
+            qrcodeInstance.makeCode(payload);
+          }
+        } catch(e) {
+          box.innerHTML = `<img src="https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(payload)}" alt="QR Code" class="w-[250px] h-[250px] mx-auto block" />`;
+        }
+
+        const bar = document.getElementById('qr-timer-bar');
+        if(bar) {
+          bar.style.transition = 'none'; bar.style.width = '100%';
+          setTimeout(() => { bar.style.transition = 'width 5s linear'; bar.style.width = '0%'; }, 50);
+        }
+      }
+      
+      renderLiveQR();
+      qrRefreshInterval = setInterval(renderLiveQR, 5000);
+      window.updateLiveLectureView();
+    };
+
+    window.handleManualFacultyEntry = function(lectureId) {
+      if(window.state.currentUser.role === 'VIEW_ONLY') return window.showToast("View Only mode active.", "error");
+      const moodleId = document.getElementById('manual-moodle-id').value.trim();
+      const student = window.state.students.find(s => String(s.moodleId) === String(moodleId));
+      if(!student) return window.showToast("Student not found", "error");
+      if(window.state.attendance.find(a => a.lectureId === lectureId && String(a.moodleId) === String(moodleId))) return window.showToast("Already marked", "info");
+
+      window.state.attendance.unshift({ 
+        id: `att_${Date.now()}`, 
+        lectureId, 
+        moodleId, 
+        studentName: student.name, 
+        rollNo: student.rollNo || 9999,
+        department: student.department, 
+        year: student.year, 
+        division: student.division, 
+        batch: student.batch, 
+        date: new Date().toISOString().split('T')[0], 
+        time: new Date().toLocaleTimeString(), 
+        status: 'Manual' 
+      });
+      window.saveStateLocalAndCloud(); 
+      document.getElementById('manual-moodle-id').value = ''; 
+      window.updateLiveLectureView(); 
+      window.showToast(`${student.name} marked!`);
+    };
+
+    window.updateLiveLectureView = function() {
+      const lectureId = window.currentActiveLectureId || (document.querySelector('button[onclick^="window.handleManualFacultyEntry("]')?.getAttribute('onclick').match(/'([^']+)'/)?.[1]);
+      if(!lectureId) return;
+
+      const currentLec = window.state.lectures.find(l => l.id === lectureId);
+      let atts = window.state.attendance.filter(a => a.lectureId === lectureId);
+      atts.sort((a, b) => Number(a.rollNo || 9999) - Number(b.rollNo || 9999));
+
+      const badge = document.getElementById('lecture-scan-count-badge');
+      if(badge) badge.innerText = `Present: ${atts.length}`;
+
+      const isViewOnly = window.state.currentUser.role === 'VIEW_ONLY';
+      const list = document.getElementById('live-attendance-list');
+      if(list && currentLec) {
+        list.innerHTML = atts.map(a => {
+          const stats = window.computeStudentStats(a.moodleId);
+          const isDefaulter = stats.pct < 75;
+
+          return `
+            <div class="flex justify-between items-center p-2.5 rounded-xl text-sm border transition-all ${isDefaulter ? 'bg-rose-50 border-rose-200' : 'bg-teal-50 border-teal-200'}">
+              <div>
+                <span class="font-bold ${isDefaulter ? 'text-rose-950' : 'text-teal-950'}">Roll #${a.rollNo || '-'} &bull; ${a.studentName}</span> 
+                <span class="text-xs text-slate-500">(${a.moodleId})</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="px-2 py-0.5 text-[10px] font-extrabold rounded-md ${isDefaulter ? 'bg-rose-200 text-rose-900' : 'bg-teal-200 text-teal-900'}">
+                  ${stats.pct}% Total
+                </span>
+                <span class="text-[10px] font-bold text-slate-500">${a.time}</span>
+                ${!isViewOnly ? `<button onclick="window.deleteLiveAttendance('${a.id}')" class="text-rose-500 hover:text-rose-700 text-lg">🗑️</button>` : ''}
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+    };
+
+    window.deleteLiveAttendance = function(attId) {
+      if(window.state.currentUser.role === 'VIEW_ONLY') return window.showToast("View Only mode active.", "error");
+      if(confirm("Remove this attendance log?")) {
+        window.state.attendance = window.state.attendance.filter(a => a.id !== attId);
+        window.saveStateLocalAndCloud(); 
+        window.updateLiveLectureView(); 
+        window.showToast("Attendance removed.");
+      }
+    };
+
+    // --- STUDENT PORTAL VIEW ---
+    window.renderStudentPortalView = function(c) {
+      const myId = window.state.currentUser.username;
+      const studentObj = window.state.students.find(s => String(s.moodleId) === String(myId)) || {};
+
+      const coordObj = window.state.coordinators.find(coord => 
+        coord.year === studentObj.year && 
+        coord.division === studentObj.division && 
+        (!coord.dept || coord.dept === studentObj.department)
+      );
+
+      let coordinatorDisplayName = "Not Assigned";
+      if (coordObj) {
+        const facUser = window.state.users.find(u => u.username === coordObj.username);
+        coordinatorDisplayName = facUser ? facUser.name : coordObj.username;
+      }
+
+      const stats = window.computeStudentStats(myId);
+
+      c.innerHTML = `
+        <div class="max-w-xl mx-auto space-y-6" id="student-portal-wrapper">
+          <div id="student-attendance-alert"></div>
+
+          <!-- STUDENT PROFILE CARD -->
+          <div class="bg-gradient-to-br from-indigo-700 via-indigo-600 to-indigo-800 text-white p-6 rounded-3xl shadow-xl space-y-4">
+            <div class="flex items-center gap-4">
+              <div class="w-16 h-16 bg-white/20 backdrop-blur-md rounded-2xl flex items-center justify-center text-3xl font-black shadow-inner">
+                ${window.state.currentUser.name.charAt(0)}
+              </div>
+              <div>
+                <h2 class="text-2xl font-black tracking-tight">${window.state.currentUser.name}</h2>
+                <p class="text-indigo-200 text-xs font-mono mt-0.5">${studentObj.email || (myId + '@apsit.edu.in')}</p>
+                <div class="mt-1.5">${stats.statusBadge}</div>
+              </div>
+            </div>
+
+            <!-- COMPREHENSIVE STUDENT DETAILS GRID -->
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-indigo-500/40 text-xs">
+              <div class="bg-white/10 p-2.5 rounded-xl backdrop-blur-xs">
+                <span class="text-indigo-200 block text-[10px] uppercase font-bold tracking-wider">Roll Number</span>
+                <span class="font-extrabold text-base text-white">#${studentObj.rollNo || 'N/A'}</span>
+              </div>
+              <div class="bg-white/10 p-2.5 rounded-xl backdrop-blur-xs">
+                <span class="text-indigo-200 block text-[10px] uppercase font-bold tracking-wider">Moodle ID</span>
+                <span class="font-extrabold text-sm text-white font-mono">${myId}</span>
+              </div>
+              <div class="bg-white/10 p-2.5 rounded-xl backdrop-blur-xs">
+                <span class="text-indigo-200 block text-[10px] uppercase font-bold tracking-wider">Class & Div</span>
+                <span class="font-extrabold text-sm text-white">${studentObj.year || 'FE'} - Div ${studentObj.division || 'A'}</span>
+              </div>
+              <div class="bg-white/10 p-2.5 rounded-xl backdrop-blur-xs">
+                <span class="text-indigo-200 block text-[10px] uppercase font-bold tracking-wider">Assigned Batch</span>
+                <span class="font-extrabold text-sm text-white">${studentObj.batch || 'Batch A1'}</span>
+              </div>
+            </div>
+
+            <div class="bg-white/15 px-3.5 py-2.5 rounded-xl text-xs flex justify-between items-center text-white border border-white/10 shadow-xs">
+              <span>Department: <strong>${studentObj.department || 'First Year'}</strong></span>
+              <span class="flex items-center gap-1">🎓 Coordinator: <strong class="text-amber-300 font-extrabold">${coordinatorDisplayName}</strong></span>
+            </div>
+
+            <button onclick="window.launchStudentQRScanner()" class="w-full mt-2 py-3.5 bg-white text-indigo-700 font-extrabold rounded-2xl shadow-lg hover:bg-slate-50 transition text-base flex items-center justify-center gap-2">
+              📷 Scan Lecture QR
+            </button>
+          </div>
+
+          <div id="student-camera-container" class="hidden bg-slate-900 rounded-3xl p-5 shadow-2xl">
+            <h3 class="text-white font-bold text-center mb-1">Align Camera with Live Screen</h3>
+            <p class="text-slate-400 text-[11px] text-center mb-4">Point at the projector or faculty display. Forwarded photos will fail.</p>
+            <div class="flex justify-center">
+              <div id="student-video-element" class="w-64 h-64 bg-black rounded-2xl overflow-hidden border-2 border-indigo-500"></div>
+            </div>
+            <button onclick="window.stopStudentScanner()" class="w-full mt-4 py-2.5 bg-rose-600 text-white font-bold rounded-xl text-sm">Cancel</button>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4" id="student-stats-grid"></div>
+          
+          <div class="bg-white rounded-2xl border p-5 shadow-xs">
+            <h3 class="font-bold text-slate-800 mb-3 flex items-center gap-1.5 text-sm">
+              📊 Subject Attendance Progress
+            </h3>
+            <div id="student-subject-bars" class="space-y-4"></div>
+          </div>
+
+          <div class="bg-white rounded-2xl border p-4"><h3 class="font-bold mb-3">Recent Classes</h3><div id="student-recent-logs" class="space-y-2"></div></div>
+          <div class="bg-white rounded-2xl border p-4"><h3 class="font-bold mb-3">Account Settings</h3><button onclick="window.promptChangePassword()" class="w-full py-2 bg-slate-100 text-slate-700 font-bold rounded-xl text-sm">Change Password</button></div>
+        </div>
+      `;
+      window.updateStudentPortalStats();
+    };
+
+    window.updateStudentPortalStats = function() {
+      const grid = document.getElementById('student-stats-grid'), subjBars = document.getElementById('student-subject-bars'), logs = document.getElementById('student-recent-logs');
+      if(!grid) return;
+
+      const myId = window.state.currentUser.username, studentObj = window.state.students.find(s => String(s.moodleId) === String(myId)) || {};
+      const relLecs = window.state.lectures.filter(l => l.year === studentObj.year && l.division === studentObj.division && (l.batch === 'Full' || l.batch === studentObj.batch));
+      const stats = window.computeStudentStats(myId);
+
+      const alertDiv = document.getElementById('student-attendance-alert');
+      if (alertDiv) {
+        if (stats.pct < 75) {
+          alertDiv.innerHTML = `
+            <div class="bg-rose-100 border border-rose-300 text-rose-800 p-4 rounded-2xl flex items-center gap-3">
+              <span class="text-2xl">⚠️</span>
+              <div>
+                <p class="font-bold text-xs uppercase tracking-wider">Attendance Defaulter Warning</p>
+                <p class="text-xs font-semibold mt-0.5">Your overall attendance is currently ${stats.pct}%, which is below the mandatory 75% cutoff.</p>
+              </div>
+            </div>
+          `;
+        } else {
+          alertDiv.innerHTML = '';
+        }
+      }
+
+      grid.innerHTML = `
+        <div class="bg-white p-4 rounded-2xl border text-center shadow-xs">
+          <span class="text-[10px] text-slate-400 font-bold uppercase">Overall Attendance</span>
+          <div class="text-3xl font-black ${stats.pct >= 75 ? 'text-teal-600' : 'text-rose-600'} mt-1">${stats.pct}%</div>
+        </div>
+        <div class="bg-white p-4 rounded-2xl border text-center shadow-xs">
+          <span class="text-[10px] text-slate-400 font-bold uppercase">Classes Attended</span>
+          <div class="text-2xl font-bold text-slate-800 mt-1">${stats.attended} <span class="text-sm text-slate-400">/ ${stats.total}</span></div>
+          <div class="text-[10px] text-rose-500 font-bold mt-1">Missed: ${stats.total - stats.attended}</div>
+        </div>
+      `;
+
+      const subjs = {}; relLecs.forEach(l => { subjs[l.subject] = { total: (subjs[l.subject]?.total || 0) + 1, att: 0 }; });
+      const myAtts = window.state.attendance.filter(a => String(a.moodleId) === String(myId));
+      myAtts.forEach(a => { const l = relLecs.find(x => x.id === a.lectureId); if(l && subjs[l.subject]) subjs[l.subject].att++; });
+      
+      subjBars.innerHTML = Object.keys(subjs).length ? Object.keys(subjs).map(k => {
+        const p = Math.round((subjs[k].att / subjs[k].total) * 100);
+        return `
+          <div>
+            <div class="flex justify-between text-xs mb-1 font-bold">
+              <span class="truncate text-slate-800">${k}</span>
+              <span class="${p >= 75 ? 'text-teal-600' : 'text-rose-600'}">${subjs[k].att}/${subjs[k].total} (${p}%)</span>
+            </div>
+            <div class="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden flex">
+              <div class="${p >= 75 ? 'bg-teal-500' : 'bg-rose-500'} h-2.5 rounded-full transition-all duration-500" style="width: ${p}%"></div>
+            </div>
+          </div>
+        `;
+      }).join('') : '<p class="text-xs text-slate-400">No lectures recorded yet.</p>';
+
+      logs.innerHTML = myAtts.slice(0, 5).map(a => {
+        const lec = window.state.lectures.find(l => l.id === a.lectureId) || {};
+        return `<div class="p-3 bg-slate-50 border rounded-xl text-sm flex justify-between"><div><p class="font-bold truncate w-40">${lec.subject || 'Class'}</p><p class="text-xs text-slate-400">${a.date}</p></div><span class="text-teal-600 font-bold text-xs">Present</span></div>`;
+      }).join('') || '<p class="text-xs text-slate-400">No records found.</p>';
+    };
+
+    window.launchStudentQRScanner = async function() {
+      const c = document.getElementById('student-camera-container'); c.classList.remove('hidden');
+      html5QrCode = new Html5Qrcode("student-video-element");
+      try {
+        await html5QrCode.start({ facingMode: "environment" }, { fps: 15, qrbox: { width: 220, height: 220 } },
+          (txt) => window.processStudentQRScan(txt), (err) => {}
+        );
+      } catch(e) {
+        c.classList.add('hidden'); window.showToast("Camera blocked! Ensure site is on HTTPS and camera is allowed.", "error");
+      }
+    };
+
+    window.stopStudentScanner = function() {
+      if(html5QrCode && html5QrCode.isScanning) html5QrCode.stop().then(() => html5QrCode.clear()).catch(()=>{});
+      document.getElementById('student-camera-container')?.classList.add('hidden');
+    };
+
+    window.processStudentQRScan = function(rawText) {
+      if(isScanningPaused) return;
+      isScanningPaused = true;
+      const parts = String(rawText).split('|');
+      
+      if (parts.length < 2) { 
+        window.showToast("Invalid QR Code.", "error"); 
+        setTimeout(() => isScanningPaused=false, 2000); 
+        return; 
+      }
+
+      const lectureId = parts[0];
+      const qrTime = parseInt(parts[1], 10);
+      const tokenNonce = parts[2] || '';
+      const currentTime = Date.now();
+      const myId = window.state.currentUser.username;
+      
+      const lecture = window.state.lectures.find(l => l.id === lectureId);
+      if(!lecture) { 
+        window.showToast("Lecture session not found.", "error"); 
+        setTimeout(() => isScanningPaused=false, 2000); 
+        return; 
+      }
+
+      if (Math.abs(currentTime - qrTime) > 7000) {
+        window.showToast("Expired QR Code. Stored photos or late scans are blocked.", "error"); 
+        setTimeout(() => isScanningPaused=false, 2000); 
+        return;
+      }
+
+      const compositeToken = `${lectureId}_${qrTime}_${tokenNonce}`;
+      if (tokenNonce && window.state.usedQrTokens.includes(compositeToken)) {
+        window.showToast("Duplicate Token: This QR snapshot has already been consumed.", "error");
+        setTimeout(() => isScanningPaused=false, 2000); 
+        return;
+      }
+
+      if(window.state.attendance.find(a => a.lectureId === lectureId && String(a.moodleId) === String(myId))) {
+        window.showToast("You have already marked attendance for this class.", "info"); 
+        window.stopStudentScanner(); 
+        return;
+      }
+
+      const studentInfo = window.state.students.find(s => String(s.moodleId) === String(myId)) || {};
+      
+      if(lecture.division !== studentInfo.division) {
+        window.showToast(`Access Denied: This lecture is for Division ${lecture.division} only.`, "error"); 
+        window.stopStudentScanner(); 
+        return;
+      }
+
+      if(lecture.batch !== 'Full' && lecture.batch !== studentInfo.batch) {
+        window.showToast(`Access Denied: This lecture is for Batch ${lecture.batch}.`, "error"); 
+        window.stopStudentScanner(); 
+        return;
+      }
+
+      let deviceLog = JSON.parse(localStorage.getItem('eduscan_device_log') || '{}');
+      if (deviceLog[lectureId] && deviceLog[lectureId] !== myId) {
+        window.showToast("Device locked: This physical phone was already used by another student.", "error"); 
+        window.stopStudentScanner(); 
+        return;
+      }
+
+      if (tokenNonce) {
+        window.state.usedQrTokens.push(compositeToken);
+      }
+
+      window.state.attendance.unshift({ 
+        id: `att_${Date.now()}`, 
+        lectureId, 
+        moodleId: myId, 
+        studentName: window.state.currentUser.name, 
+        rollNo: studentInfo.rollNo || 9999,
+        department: studentInfo.department, 
+        year: studentInfo.year, 
+        division: studentInfo.division, 
+        batch: studentInfo.batch, 
+        date: new Date().toISOString().split('T')[0], 
+        time: new Date().toLocaleTimeString(), 
+        status: 'Live Dynamic QR' 
+      });
+
+      deviceLog[lectureId] = myId; 
+      localStorage.setItem('eduscan_device_log', JSON.stringify(deviceLog));
+      
+      window.saveStateLocalAndCloud(); 
+      window.stopStudentScanner(); 
+      window.updateStudentPortalStats(); 
+      window.showToast("Attendance Marked Successfully!");
+    };
+
+    window.promptChangePassword = function() {
+      const newPass = prompt("Enter new password (min 6 chars):");
+      if(newPass && newPass.length >= 6) {
+        if(window.state.currentUser.role === 'STUDENT') {
+          const s = window.state.students.find(x => x.moodleId === window.state.currentUser.username);
+          if(s) s.password = newPass;
+        } else {
+          const u = window.state.users.find(x => x.username === window.state.currentUser.username);
+          if(u) u.password = newPass;
+        }
+        window.saveStateLocalAndCloud(); window.showToast("Password updated!");
+      } else if (newPass) window.showToast("Password too short.", "error");
+    };
+
+    // --- STUDENTS DIRECTORY ---
+    window.renderStudentsView = function(c) {
+      const isViewOnly = window.state.currentUser.role === 'VIEW_ONLY';
+      const isAdminOrHod = (window.state.currentUser.role === 'ADMIN' || window.state.currentUser.role === 'HOD');
+      const isFaculty = window.state.currentUser.role === 'FACULTY';
+      const coordAssignment = window.state.coordinators.find(coord => coord.username === window.state.currentUser.username);
+
+      if (isFaculty && !coordAssignment) {
+        c.innerHTML = `
+          <div class="max-w-xl mx-auto mt-16 bg-white p-8 rounded-3xl border shadow-sm text-center space-y-4">
+            <div class="w-16 h-16 bg-amber-100 text-amber-800 rounded-full flex items-center justify-center text-3xl mx-auto">🔒</div>
+            <h3 class="text-xl font-bold text-slate-900">Access Restricted</h3>
+            <p class="text-slate-600 text-sm">
+              You are logged in as Faculty, but you have not been assigned as a <strong>Class Coordinator</strong> for any division.
+            </p>
+            <p class="text-xs text-slate-400 bg-slate-50 p-3 rounded-xl border">
+              Only assigned Class Coordinators, HODs, and Admins can view or edit the Student Directory. Contact your HOD to assign your coordinator role in the <strong>Coordinators</strong> tab.
+            </p>
+          </div>
+        `;
+        return;
+      }
+
+      c.innerHTML = `
+        <div class="space-y-4 pb-20">
+          <div class="bg-white p-6 rounded-2xl border flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 shadow-xs">
+            <div>
+              <h2 class="text-2xl font-bold">Students Directory</h2>
+              <p class="text-slate-500 text-sm">
+                ${coordAssignment ? `<strong class="text-indigo-900">Class Coordinator Mode:</strong> Viewing students for ${coordAssignment.year} Div ${coordAssignment.division} (${coordAssignment.dept})` : 'Manage, filter, edit, and promote student data.'}
+              </p>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button onclick="window.exportDirectoryCSV()" class="px-4 py-2 bg-teal-600 text-white font-bold rounded-xl text-sm">Export CSV</button>
+              ${!isViewOnly ? `
+                <button onclick="window.openAddStudentModal()" class="px-4 py-2 bg-indigo-600 text-white font-bold rounded-xl text-sm">+ Add Student</button>
+              ` : ''}
+              ${isAdminOrHod ? `<button onclick="window.openAcademicMigrationModal()" class="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white font-bold rounded-xl text-sm shadow-sm">🎓 Migration Tool</button>` : ''}
+            </div>
+          </div>
+          
+          <div class="bg-white p-4 rounded-2xl border shadow-xs grid grid-cols-1 sm:grid-cols-4 gap-3">
+            <input id="filter-search" type="text" oninput="window.filterStudentsList()" placeholder="Search Name / Roll No / Moodle ID..." class="px-3 py-2 bg-slate-50 border rounded-xl text-xs" />
+            <select id="filter-dept" onchange="window.filterStudentsList()" ${coordAssignment ? 'disabled' : ''} class="px-3 py-2 bg-slate-50 border rounded-xl text-xs">
+              <option value="">All Departments</option>
+              ${DEPARTMENTS.map(d => `<option value="${d}">${d}</option>`).join('')}
+            </select>
+            <select id="filter-year" onchange="window.filterStudentsList(); window.updateDivOptionsForYear('filter-year', 'filter-div');" ${coordAssignment ? 'disabled' : ''} class="px-3 py-2 bg-slate-50 border rounded-xl text-xs">
+              <option value="">All Years</option>
+              ${YEARS.map(y => `<option value="${y}">${y}</option>`).join('')}
+            </select>
+            <select id="filter-div" onchange="window.filterStudentsList()" ${coordAssignment ? 'disabled' : ''} class="px-3 py-2 bg-slate-50 border rounded-xl text-xs font-bold text-indigo-900">
+              <option value="">All Divisions</option>
+              ${FE_DIVISIONS.map(d => `<option value="${d}">Division ${d}</option>`).join('')}
+            </select>
+          </div>
+
+          ${!isViewOnly ? `
+          <div class="flex gap-2 items-center bg-white p-3 rounded-xl border">
+            <input type="checkbox" id="select-all-cb" onchange="window.toggleSelectAll(this)" class="w-5 h-5 rounded border-slate-300">
+            <span class="text-sm font-bold text-slate-700">Select All</span>
+          </div>
+          ` : ''}
+          
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4" id="student-grid-container">
+          </div>
+        </div>
+      `;
+      window.filterStudentsList();
+    };
+
+    window.openAcademicMigrationModal = function() {
+      const c = window.getModalContainer();
+      c.innerHTML = `
+        <div class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div class="bg-white rounded-2xl max-w-md w-full p-6 space-y-4">
+            <h3 class="font-bold text-lg text-purple-900">🎓 Academic Year Migration Tool</h3>
+            <p class="text-xs text-slate-500">Bulk promote students from one year to the next for a specific division.</p>
+            <form onsubmit="window.handleMigrationSubmit(event)" class="space-y-3">
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">Select Department</label>
+                <select id="mig-dept" class="w-full px-3 py-2 border rounded-xl text-sm">${DEPARTMENTS.map(d => `<option value="${d}">${d}</option>`).join('')}</select>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 mb-1">From Year</label>
+                  <select id="mig-from-year" class="w-full px-3 py-2 border rounded-xl text-sm">
+                    <option value="FE">First Year (FE)</option>
+                    <option value="SE">Second Year (SE)</option>
+                    <option value="TE">Third Year (TE)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 mb-1">To Year</label>
+                  <select id="mig-to-year" class="w-full px-3 py-2 border rounded-xl text-sm">
+                    <option value="SE">Second Year (SE)</option>
+                    <option value="TE">Third Year (TE)</option>
+                    <option value="BE">Final Year (BE)</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">Division</label>
+                <select id="mig-div" class="w-full px-3 py-2 border rounded-xl text-sm">${FE_DIVISIONS.map(d => `<option value="${d}">Division ${d}</option>`).join('')}</select>
+              </div>
+              <div class="flex gap-2 justify-end pt-2">
+                <button type="button" onclick="window.closeModal()" class="px-4 py-2 bg-slate-100 rounded-xl text-sm font-bold">Cancel</button>
+                <button type="submit" class="px-4 py-2 bg-purple-600 text-white rounded-xl text-sm font-bold">Promote Division</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+    };
+
+    window.handleMigrationSubmit = function(e) {
+      e.preventDefault();
+      const dept = document.getElementById('mig-dept').value;
+      const fromYr = document.getElementById('mig-from-year').value;
+      const toYr = document.getElementById('mig-to-year').value;
+      const div = document.getElementById('mig-div').value;
+
+      let promotedCount = 0;
+      window.state.students.forEach(s => {
+        if(s.department === dept && s.year === fromYr && s.division === div) {
+          s.year = toYr;
+          promotedCount++;
+        }
+      });
+
+      window.saveStateLocalAndCloud();
+      window.closeModal();
+      window.switchTab('students');
+      window.showToast(`Promoted ${promotedCount} students from ${fromYr} to ${toYr} Div ${div}!`);
+    };
+
+    window.filterStudentsList = function() {
+      const search = (document.getElementById('filter-search')?.value || '').toLowerCase();
+      let dept = document.getElementById('filter-dept')?.value || '';
+      let year = document.getElementById('filter-year')?.value || '';
+      let div = document.getElementById('filter-div')?.value || '';
+
+      const coordAssignment = window.state.coordinators.find(c => c.username === window.state.currentUser.username);
+
+      if(window.state.currentUser.role === 'FACULTY' && coordAssignment) {
+        dept = coordAssignment.dept;
+        year = coordAssignment.year;
+        div = coordAssignment.division;
+      }
+
+      const grid = document.getElementById('student-grid-container');
+      if (!grid) return;
+
+      let filtered = window.state.students.filter(s => {
+        const matchesSearch = s.name.toLowerCase().includes(search) || String(s.moodleId).includes(search) || String(s.rollNo || '').includes(search);
+        const matchesDept = !dept || s.department === dept;
+        const matchesYear = !year || s.year === year;
+        const matchesDiv = !div || s.division === div;
+        return matchesSearch && matchesDept && matchesYear && matchesDiv;
+      });
+
+      filtered.sort((a, b) => Number(a.rollNo || 9999) - Number(b.rollNo || 9999));
+
+      const isViewOnly = window.state.currentUser.role === 'VIEW_ONLY';
+      const isAdminOrHod = (window.state.currentUser.role === 'ADMIN' || window.state.currentUser.role === 'HOD');
+
+      grid.innerHTML = filtered.map(s => {
+        const stats = window.computeStudentStats(s.moodleId);
+        return `
+          <div class="bg-white p-4 rounded-xl border flex items-start gap-3 shadow-sm ${window.selectedStudents.has(s.moodleId) ? 'border-indigo-400 bg-indigo-50' : ''}">
+            ${!isViewOnly ? `<input type="checkbox" value="${s.moodleId}" ${window.selectedStudents.has(s.moodleId) ? 'checked' : ''} onchange="window.toggleStudentSelection(this)" class="w-5 h-5 mt-1 rounded border-slate-300 student-cb">` : ''}
+            <div class="flex-1">
+              <div class="flex justify-between items-start">
+                <div>
+                  <div class="flex items-center gap-1.5 flex-wrap">
+                    <span class="px-2 py-0.5 bg-indigo-100 text-indigo-800 text-[10px] font-bold rounded">Roll #${s.rollNo || 'N/A'}</span>
+                    ${stats.statusBadge}
+                  </div>
+                  <p onclick="window.openStudentProfileCard('${s.moodleId}')" class="font-bold text-slate-900 mt-1 hover:text-indigo-600 hover:underline cursor-pointer">${s.name}</p>
+                  <p class="text-xs font-mono text-slate-500">${s.moodleId}</p>
+                  <p class="text-[10px] text-slate-400 font-mono mb-1">${s.email || (s.moodleId + '@apsit.edu.in')}</p>
+                </div>
+                <div class="flex flex-col gap-1 items-end">
+                  ${!isViewOnly ? `<button onclick="window.openEditStudentModal('${s.moodleId}')" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-bold transition">✏️ Edit</button>` : ''}
+                  ${isAdminOrHod ? `<button onclick="window.resetStudentPassword('${s.moodleId}')" class="px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded text-[10px] font-bold transition">🔑 Reset Pass</button>` : ''}
+                </div>
+              </div>
+              <div class="flex flex-wrap gap-1 mt-2">
+                <span class="px-2 py-0.5 bg-slate-100 text-[10px] font-bold rounded">${s.year} - Div ${s.division}</span>
+                <span class="px-2 py-0.5 bg-slate-100 text-[10px] font-bold rounded">Batch ${s.batch}</span>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      if (filtered.length === 0) {
+        grid.innerHTML = '<p class="text-slate-400 col-span-full text-center py-8">No students found matching filters.</p>';
+      }
+    };
+
+    window.openStudentProfileCard = function(moodleId) {
+      const student = window.state.students.find(s => String(s.moodleId) === String(moodleId));
+      if(!student) return;
+
+      const stats = window.computeStudentStats(moodleId);
+      const myAtts = window.state.attendance.filter(a => String(a.moodleId) === String(moodleId));
+      const relLecs = window.state.lectures.filter(l => l.year === student.year && l.division === student.division && (l.batch === 'Full' || l.batch === student.batch));
+
+      const c = window.getModalContainer();
+      c.innerHTML = `
+        <div class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div class="bg-white rounded-3xl max-w-lg w-full p-6 space-y-5 shadow-2xl overflow-y-auto max-h-[90vh]">
+            <div class="flex justify-between items-start border-b pb-4">
+              <div class="flex items-center gap-3">
+                <div class="w-12 h-12 rounded-2xl bg-indigo-600 text-white font-black text-xl flex items-center justify-center">${student.name.charAt(0)}</div>
+                <div>
+                  <h3 class="font-extrabold text-lg text-slate-900">${student.name}</h3>
+                  <p class="text-xs font-mono text-indigo-600">ID: ${student.moodleId} &bull; Roll #${student.rollNo || '-'}</p>
+                  <div class="mt-1">${stats.statusBadge}</div>
+                </div>
+              </div>
+              <button onclick="window.closeModal()" class="text-slate-400 hover:text-slate-600 font-bold text-xl">✕</button>
+            </div>
+
+            <div class="grid grid-cols-2 gap-3 bg-slate-50 p-4 rounded-2xl border text-xs">
+              <div><span class="text-slate-400 font-semibold">Email:</span> <p class="font-mono font-bold text-slate-800 truncate">${student.email || (student.moodleId + '@apsit.edu.in')}</p></div>
+              <div><span class="text-slate-400 font-semibold">Department:</span> <p class="font-bold text-slate-800">${student.department}</p></div>
+              <div><span class="text-slate-400 font-semibold">Class:</span> <p class="font-bold text-slate-800">${student.year} - Div ${student.division}</p></div>
+              <div><span class="text-slate-400 font-semibold">Batch:</span> <p class="font-bold text-slate-800">Batch ${student.batch}</p></div>
+            </div>
+
+            <div class="p-4 rounded-2xl border flex justify-between items-center ${stats.pct >= 75 ? 'bg-teal-50 border-teal-200' : 'bg-rose-50 border-rose-200'}">
+              <div>
+                <p class="text-xs font-bold uppercase ${stats.pct >= 75 ? 'text-teal-800' : 'text-rose-800'}">Overall Attendance</p>
+                <p class="text-2xl font-black ${stats.pct >= 75 ? 'text-teal-600' : 'text-rose-600'}">${stats.pct}%</p>
+              </div>
+              <div class="text-right text-xs font-bold text-slate-600">
+                <p>Attended: ${stats.attended} / ${stats.total}</p>
+                <p class="text-rose-500">Missed: ${stats.total - stats.attended}</p>
+              </div>
+            </div>
+
+            <div>
+              <h4 class="font-bold text-xs text-slate-700 mb-2">Chronological Attendance History</h4>
+              <div class="space-y-1.5 max-h-48 overflow-y-auto pr-1 text-xs">
+                ${relLecs.map(l => {
+                  const wasPresent = myAtts.some(a => a.lectureId === l.id);
+                  return `
+                    <div class="p-2.5 rounded-xl border flex justify-between items-center ${wasPresent ? 'bg-teal-50/50 border-teal-100' : 'bg-rose-50/50 border-rose-100'}">
+                      <div>
+                        <p class="font-bold text-slate-800">${l.subject} <span class="text-[10px] font-normal text-slate-500">(${l.sessionType || 'Theory'})</span></p>
+                        <p class="text-[10px] text-slate-400">${l.date} &bull; ${l.facultyName}</p>
+                      </div>
+                      <span class="px-2 py-0.5 text-[10px] font-bold rounded-md ${wasPresent ? 'bg-teal-100 text-teal-800' : 'bg-rose-100 text-rose-800'}">
+                        ${wasPresent ? 'Present' : 'Absent'}
+                      </span>
+                    </div>
+                  `;
+                }).join('')}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    };
+
+    window.resetStudentPassword = function(moodleId) {
+      const student = window.state.students.find(s => s.moodleId === moodleId);
+      if(!student) return;
+      const newPass = prompt(`Reset password for student ${student.name} (${moodleId}):`, "123456");
+      if(newPass) {
+        student.password = newPass;
+        window.saveStateLocalAndCloud();
+        window.showToast(`Password for ${student.name} reset to: ${newPass}`);
+      }
+    };
+
+    window.toggleStudentSelection = function(cb) {
+      if(cb.checked) window.selectedStudents.add(cb.value); else window.selectedStudents.delete(cb.value);
+      cb.closest('div.bg-white').className = `bg-white p-4 rounded-xl border flex items-start gap-3 shadow-sm ${cb.checked ? 'border-indigo-400 bg-indigo-50' : ''}`;
+      window.updateBulkActionBar();
+    };
+    
+    window.toggleSelectAll = function(cb) {
+      document.querySelectorAll('.student-cb').forEach(el => { el.checked = cb.checked; window.toggleStudentSelection(el); });
+    };
+
+    window.updateBulkActionBar = function() {
+      const bar = document.getElementById('bulk-action-bar');
+      if(window.selectedStudents.size > 0 && window.state.currentUser.role !== 'VIEW_ONLY') {
+        bar.classList.remove('translate-y-full', 'hidden');
+        bar.innerHTML = `<div class="font-bold text-indigo-900">${window.selectedStudents.size} Selected</div><div class="flex gap-2"><button onclick="window.openBulkEditModal()" class="px-4 py-2 bg-indigo-100 text-indigo-700 font-bold rounded-xl text-sm">Bulk Edit (Dept/Year/Div/Batch)</button><button onclick="window.bulkDelete()" class="px-4 py-2 bg-rose-600 text-white font-bold rounded-xl text-sm">Delete</button></div>`;
+      } else { bar.classList.add('translate-y-full'); setTimeout(() => bar.classList.add('hidden'), 300); }
+    };
+
+    window.bulkDelete = function() {
+      if(confirm(`Delete ${window.selectedStudents.size} students permanently?`)) {
+        window.state.students = window.state.students.filter(s => !window.selectedStudents.has(s.moodleId));
+        window.selectedStudents.clear(); window.saveStateLocalAndCloud(); window.switchTab('students');
+      }
+    };
+
+    window.openBulkEditModal = function() {
+      const c = window.getModalContainer();
+      c.innerHTML = `
+        <div class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div class="bg-white rounded-2xl max-w-md w-full p-6 space-y-4">
+            <h3 class="font-bold text-lg">Bulk Edit ${window.selectedStudents.size} Students</h3>
+            <p class="text-xs text-slate-500">Only non-empty fields will be updated for selected students.</p>
+            <form onsubmit="window.handleBulkEditSubmit(event)" class="space-y-3">
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">New Department</label>
+                <select id="bulk-edit-dept" class="w-full px-3 py-2 border rounded-xl text-sm">
+                  <option value="">-- No Change --</option>
+                  ${DEPARTMENTS.map(d => `<option value="${d}">${d}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">New Year</label>
+                <select id="bulk-edit-year" onchange="window.updateDivOptionsForYear('bulk-edit-year', 'bulk-edit-div')" class="w-full px-3 py-2 border rounded-xl text-sm">
+                  <option value="">-- No Change --</option>
+                  ${YEARS.map(y => `<option value="${y}">${y}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">New Division</label>
+                <select id="bulk-edit-div" onchange="window.updateBatchOptions('bulk-edit-div', 'bulk-edit-batch', true)" class="w-full px-3 py-2 border rounded-xl text-sm">
+                  <option value="">-- No Change --</option>
+                  ${FE_DIVISIONS.map(d => `<option value="${d}">Division ${d}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">New Batch</label>
+                <select id="bulk-edit-batch" class="w-full px-3 py-2 border rounded-xl text-sm">
+                  <option value="">-- No Change --</option>
+                </select>
+              </div>
+              <div class="flex gap-2 justify-end pt-2">
+                <button type="button" onclick="window.closeModal()" class="px-4 py-2 bg-slate-100 rounded-xl text-sm font-bold">Cancel</button>
+                <button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold">Update All</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+    };
+
+    window.handleBulkEditSubmit = function(e) {
+      e.preventDefault();
+      const dept = document.getElementById('bulk-edit-dept').value;
+      const yr = document.getElementById('bulk-edit-year').value;
+      const div = document.getElementById('bulk-edit-div').value;
+      const batch = document.getElementById('bulk-edit-batch').value;
+
+      window.state.students.forEach(s => {
+        if(window.selectedStudents.has(s.moodleId)) {
+          if(dept) s.department = dept;
+          if(yr) s.year = yr;
+          if(div) s.division = div;
+          if(batch) s.batch = batch;
+        }
+      });
+
+      window.selectedStudents.clear();
+      window.saveStateLocalAndCloud();
+      window.closeModal();
+      window.switchTab('students');
+      showToast("Selected students updated successfully!");
+    };
+
+    window.openEditStudentModal = function(moodleId) {
+      const student = window.state.students.find(s => s.moodleId === moodleId);
+      if(!student) return;
+
+      const c = window.getModalContainer();
+      c.innerHTML = `
+        <div class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div class="bg-white rounded-2xl max-w-md w-full p-6 space-y-4">
+            <h3 class="font-bold text-lg">Edit Student Details</h3>
+            <form onsubmit="window.handleEditStudentSubmit(event, '${moodleId}')" class="space-y-3">
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 mb-1">Moodle ID</label>
+                  <input id="edit-s-id" type="text" value="${student.moodleId}" oninput="document.getElementById('edit-s-email').value = this.value.trim() ? this.value.trim() + '@apsit.edu.in' : ''" required class="w-full px-3 py-2 border rounded-xl text-sm font-mono" />
+                </div>
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 mb-1">Roll Number</label>
+                  <input id="edit-s-roll" type="number" value="${student.rollNo || ''}" required class="w-full px-3 py-2 border rounded-xl text-sm" />
+                </div>
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">Email Address (@apsit.edu.in)</label>
+                <input id="edit-s-email" type="email" value="${student.email || (student.moodleId + '@apsit.edu.in')}" readonly class="w-full px-3 py-2 border rounded-xl text-sm bg-slate-100 font-mono text-slate-600" />
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">Full Name</label>
+                <input id="edit-s-name" type="text" value="${student.name}" required class="w-full px-3 py-2 border rounded-xl text-sm" />
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">Department</label>
+                <select id="edit-s-dept" class="w-full px-3 py-2 border rounded-xl text-sm">
+                  ${DEPARTMENTS.map(d => `<option value="${d}" ${d === student.department ? 'selected' : ''}>${d}</option>`).join('')}
+                </select>
+              </div>
+              <div class="grid grid-cols-3 gap-2">
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 mb-1">Year</label>
+                  <select id="edit-s-year" onchange="window.updateDivOptionsForYear('edit-s-year', 'edit-s-div')" class="w-full px-3 py-2 border rounded-xl text-sm">
+                    ${YEARS.map(y => `<option value="${y}" ${y === student.year ? 'selected' : ''}>${y}</option>`).join('')}
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 mb-1">Division</label>
+                  <select id="edit-s-div" onchange="window.updateBatchOptions('edit-s-div', 'edit-s-batch')" class="w-full px-3 py-2 border rounded-xl text-sm">
+                    ${FE_DIVISIONS.map(d => `<option value="${d}">Division ${d}</option>`).join('')}
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 mb-1">Batch</label>
+                  <select id="edit-s-batch" class="w-full px-3 py-2 border rounded-xl text-sm">
+                  </select>
+                </div>
+              </div>
+              <div class="flex gap-2 justify-end pt-2">
+                <button type="button" onclick="window.closeModal()" class="px-4 py-2 bg-slate-100 rounded-xl text-sm font-bold">Cancel</button>
+                <button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold">Save Changes</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+      
+      window.updateBatchOptions('edit-s-div', 'edit-s-batch');
+      document.getElementById('edit-s-batch').value = student.batch;
+    };
+
+    window.handleEditStudentSubmit = function(e, oldMoodleId) {
+      e.preventDefault();
+      const newMoodleId = document.getElementById('edit-s-id').value.trim();
+      const student = window.state.students.find(s => s.moodleId === oldMoodleId);
+      
+      if(!student) return;
+
+      if(newMoodleId !== oldMoodleId && window.state.students.find(s => s.moodleId === newMoodleId)) {
+        return window.showToast("Moodle ID already exists!", "error");
+      }
+
+      if(newMoodleId !== oldMoodleId) {
+        window.state.attendance.forEach(a => { if(a.moodleId === oldMoodleId) a.moodleId = newMoodleId; });
+      }
+
+      student.moodleId = newMoodleId;
+      student.email = `${newMoodleId}@apsit.edu.in`;
+      student.rollNo = Number(document.getElementById('edit-s-roll').value);
+      student.name = document.getElementById('edit-s-name').value.trim();
+      student.department = document.getElementById('edit-s-dept').value;
+      student.year = document.getElementById('edit-s-year').value;
+      student.division = document.getElementById('edit-s-div').value;
+      student.batch = document.getElementById('edit-s-batch').value;
+
+      window.saveStateLocalAndCloud();
+      window.closeModal();
+      window.switchTab('students');
+      showToast(`Student details for ${student.name} updated!`);
+    };
+
+    window.openAddStudentModal = function() {
+      const c = window.getModalContainer();
+      c.innerHTML = `
+        <div class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div class="bg-white rounded-2xl max-w-md w-full p-6 space-y-4">
+            <h3 class="font-bold text-lg">Register Student</h3>
+            <form onsubmit="window.handleSaveNewStudent(event)" class="space-y-3">
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-[10px] font-bold text-slate-500 mb-0.5">Moodle ID</label>
+                  <input id="s-id" type="text" placeholder="e.g. 25104203" oninput="document.getElementById('s-email').value = this.value.trim() ? this.value.trim() + '@apsit.edu.in' : ''" required class="w-full px-3 py-2 border rounded-xl text-sm font-mono" />
+                </div>
+                <div>
+                  <label class="block text-[10px] font-bold text-slate-500 mb-0.5">Roll No.</label>
+                  <input id="s-roll" type="number" placeholder="Roll No" required class="w-full px-3 py-2 border rounded-xl text-sm" />
+                </div>
+              </div>
+              <div>
+                <label class="block text-[10px] font-bold text-slate-500 mb-0.5">Auto Generated Email</label>
+                <input id="s-email" type="email" placeholder="[MoodleID]@apsit.edu.in" readonly class="w-full px-3 py-2 border rounded-xl text-sm bg-slate-100 font-mono text-slate-600" />
+              </div>
+              <div>
+                <label class="block text-[10px] font-bold text-slate-500 mb-0.5">Full Name</label>
+                <input id="s-name" type="text" placeholder="Full Name" required class="w-full px-3 py-2 border rounded-xl text-sm" />
+              </div>
+              <select id="s-dept" class="w-full px-3 py-2 border rounded-xl text-sm">${DEPARTMENTS.map(d=>`<option>${d}</option>`).join('')}</select>
+              <div class="grid grid-cols-3 gap-2">
+                <select id="s-year" onchange="window.updateDivOptionsForYear('s-year', 's-div'); updateBatchOptions('s-div', 's-batch');" class="w-full px-3 py-2 border rounded-xl text-sm">${YEARS.map(y=>`<option value="${y}">${y}</option>`).join('')}</select>
+                <select id="s-div" onchange="window.updateBatchOptions('s-div', 's-batch')" class="w-full px-3 py-2 border rounded-xl text-sm font-bold text-indigo-900 bg-indigo-50"></select>
+                <select id="s-batch" class="w-full px-3 py-2 border rounded-xl text-sm">
+                </select>
+              </div>
+              <div class="flex gap-2 justify-end pt-2">
+                <button type="button" onclick="window.closeModal()" class="px-4 py-2 bg-slate-100 rounded-xl text-sm font-bold">Cancel</button>
+                <button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold">Save</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+      window.updateDivOptionsForYear('s-year', 's-div');
+      window.updateBatchOptions('s-div', 's-batch');
+    };
+
+    window.handleSaveNewStudent = function(e) {
+      e.preventDefault();
+      const id = document.getElementById('s-id').value.trim();
+      if(window.state.students.find(x => x.moodleId === id)) return window.showToast('Moodle ID already exists!', 'error');
+
+      const email = `${id}@apsit.edu.in`;
+      window.state.students.unshift({
+        moodleId: id,
+        email: email,
+        rollNo: Number(document.getElementById('s-roll').value),
+        name: document.getElementById('s-name').value.trim(),
+        department: document.getElementById('s-dept').value,
+        year: document.getElementById('s-year').value,
+        division: document.getElementById('s-div').value,
+        batch: document.getElementById('s-batch').value,
+        password: '123456'
+      });
+
+      window.saveStateLocalAndCloud();
+      window.closeModal();
+      window.switchTab('students');
+      showToast(`Registered ${id} with email ${email}`);
+    };
+
+    window.exportDirectoryCSV = function() {
+      let csv = "Roll No,Moodle ID,Email,Name,Department,Year,Division,Batch\n";
+      let sorted = [...window.state.students].sort((a,b) => Number(a.rollNo||9999) - Number(b.rollNo||9999));
+      sorted.forEach(s => {
+        const stats = window.computeStudentStats(s.moodleId);
+        csv += `"${s.rollNo || ''}","${s.moodleId}","${s.email || (s.moodleId+'@apsit.edu.in')}","${s.name}","${s.department}","${s.year}","${s.division}","${s.batch}",${stats.total},${stats.attended},${stats.pct}%\n`;
+      });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+      a.download = `Student_Directory_${new Date().toISOString().split('T')[0]}.csv`; a.click();
+    };
+
+    // --- REPORTS TAB ---
+    window.switchReportType = function(type) {
+      window.currentReportType = type;
+      window.generateReportTable();
+    };
+
+    window.renderReportsView = function(c) {
+      const isFaculty = window.state.currentUser.role === 'FACULTY';
+      const coordAssignment = window.state.coordinators.find(coord => coord.username === window.state.currentUser.username);
+
+      if (isFaculty && !coordAssignment) {
+        c.innerHTML = `
+          <div class="max-w-xl mx-auto mt-16 bg-white p-8 rounded-3xl border shadow-sm text-center space-y-4">
+            <div class="w-16 h-16 bg-amber-100 text-amber-800 rounded-full flex items-center justify-center text-3xl mx-auto">🔒</div>
+            <h3 class="text-xl font-bold text-slate-900">Access Restricted</h3>
+            <p class="text-slate-600 text-sm">
+              You are logged in as Faculty, but you have not been assigned as a <strong>Class Coordinator</strong> for any division.
+            </p>
+            <p class="text-xs text-slate-400 bg-slate-50 p-3 rounded-xl border">
+              Only assigned Class Coordinators, HODs, and Admins can view or generate class reports. Contact your HOD to assign your coordinator role in the <strong>Coordinators</strong> tab.
+            </p>
+          </div>
+        `;
+        return;
+      }
+
+      // Automatically sync dropdowns to coordinator assignment if set
+      let defaultDept = coordAssignment ? coordAssignment.dept : DEPARTMENTS[0];
+      let defaultYear = coordAssignment ? coordAssignment.year : 'SE';
+      let defaultDiv = coordAssignment ? coordAssignment.division : 'A';
+
+      c.innerHTML = `
+        <div class="space-y-6">
+          <div class="bg-white p-6 rounded-2xl border flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 shadow-xs no-print">
+            <div>
+              <h2 class="text-2xl font-bold">Analytics & Reports</h2>
+              <p class="text-slate-500 text-sm">
+                ${coordAssignment ? `<strong class="text-indigo-900">Class Coordinator Mode:</strong> Reports locked to ${coordAssignment.year} Div ${coordAssignment.division} (${coordAssignment.dept})` : 'Toggle between Theory and Lab reports, filter by custom date windows, and export.'}
+              </p>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button onclick="window.print()" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl text-sm shadow-sm flex items-center gap-1.5 transition">
+                🖨️ Print / Save as PDF
+              </button>
+              <button onclick="window.exportDefaultersOnlyCSV()" class="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-xl text-sm shadow-sm flex items-center gap-1.5 transition">
+                ⚠️ Export Defaulters CSV (&lt;75%)
+              </button>
+              <button onclick="window.triggerLowAttendanceEmailAlerts()" class="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-sm shadow-sm flex items-center gap-1.5 transition">
+                📧 Alert Low Attendance (&lt;75%)
+              </button>
+              <button onclick="window.exportFullReport()" class="px-4 py-2 bg-teal-600 text-white font-bold rounded-xl text-sm shadow-sm">Export Full CSV</button>
+            </div>
+          </div>
+
+          <div id="defaulter-summary-cards" class="grid grid-cols-1 sm:grid-cols-3 gap-4 no-print"></div>
+          
+          <div class="bg-white p-4 rounded-2xl border shadow-xs space-y-4 no-print">
+            <div class="flex border-b pb-3 items-center justify-between">
+              <div class="flex bg-slate-100 p-1 rounded-xl">
+                <button id="btn-report-theory" onclick="window.switchReportType('Theory')" class="px-5 py-2 rounded-lg text-xs font-bold transition ${window.currentReportType === 'Theory' ? 'bg-indigo-600 text-white shadow-xs' : 'text-slate-600'}">
+                  📖 Theory Report
+                </button>
+                <button id="btn-report-lab" onclick="window.switchReportType('Lab')" class="px-5 py-2 rounded-lg text-xs font-bold transition ${window.currentReportType === 'Lab' ? 'bg-indigo-600 text-white shadow-xs' : 'text-slate-600'}">
+                  🧪 Lab Report
+                </button>
+              </div>
+              <span class="text-xs font-semibold text-slate-500">
+                Viewing: <strong class="text-indigo-900">${window.currentReportType} Attendance Statistics</strong>
+              </span>
+            </div>
+
+            <!-- FILTERS INCLUDING CUSTOM DATE RANGE -->
+            <div class="grid grid-cols-1 sm:grid-cols-5 gap-3">
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">Department</label>
+                <select id="rpt-filter-dept" onchange="window.generateReportTable()" ${coordAssignment ? 'disabled' : ''} class="w-full px-3 py-2 bg-slate-50 border rounded-xl text-xs">
+                  <option value="">All Departments</option>
+                  ${DEPARTMENTS.map(d => `<option value="${d}" ${d === defaultDept ? 'selected' : ''}>${d}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">Academic Year</label>
+                <select id="rpt-filter-year" onchange="window.generateReportTable(); window.updateDivOptionsForYear('rpt-filter-year', 'rpt-filter-div');" ${coordAssignment ? 'disabled' : ''} class="w-full px-3 py-2 bg-slate-50 border rounded-xl text-xs">
+                  ${YEARS.map(y => `<option value="${y}" ${y === defaultYear ? 'selected' : ''}>${y}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">Division</label>
+                <select id="rpt-filter-div" onchange="window.generateReportTable()" ${coordAssignment ? 'disabled' : ''} class="w-full px-3 py-2 bg-slate-50 border rounded-xl text-xs font-bold text-indigo-900">
+                  ${window.getDivisionsForYear(defaultYear).map(d => `<option value="${d}" ${d === defaultDiv ? 'selected' : ''}>Division ${d}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">From Date</label>
+                <input id="rpt-filter-from" type="date" onchange="window.generateReportTable()" class="w-full px-3 py-2 bg-slate-50 border rounded-xl text-xs" />
+              </div>
+              <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">To Date</label>
+                <input id="rpt-filter-to" type="date" onchange="window.generateReportTable()" class="w-full px-3 py-2 bg-slate-50 border rounded-xl text-xs" />
+              </div>
+            </div>
+          </div>
+
+          <div id="printable-report-area" class="bg-white rounded-2xl border shadow-xs overflow-hidden">
+            <div id="report-table-container" class="overflow-x-auto">
+            </div>
+          </div>
+        </div>
+      `;
+      window.generateReportTable();
+    };
+
+    window.exportDefaultersOnlyCSV = function() {
+      let dept = document.getElementById('rpt-filter-dept')?.value || '';
+      let year = document.getElementById('rpt-filter-year')?.value || 'SE';
+      let div = document.getElementById('rpt-filter-div')?.value || 'A';
+      const fromDate = document.getElementById('rpt-filter-from')?.value || '';
+      const toDate = document.getElementById('rpt-filter-to')?.value || '';
+
+      const coordAssignment = window.state.coordinators.find(c => c.username === window.state.currentUser.username);
+      if(window.state.currentUser.role === 'FACULTY' && coordAssignment) {
+        dept = coordAssignment.dept;
+        year = coordAssignment.year;
+        div = coordAssignment.division;
+      }
+
+      const classStudents = window.state.students.filter(s => s.year === year && s.division === div && (!dept || s.department === dept));
+      let classLectures = window.state.lectures.filter(l => l.year === year && l.division === div && (!dept || l.department === dept));
+      if (fromDate) classLectures = classLectures.filter(l => l.date >= fromDate);
+      if (toDate) classLectures = classLectures.filter(l => l.date <= toDate);
+
+      let csv = `OFFICIAL DEFAULTER LIST (<75% ATTENDANCE) - ${year} Div ${div}\n`;
+      csv += "Roll No,Moodle ID,Email,Name,Department,Year,Division,Batch,Total Conducted,Attended,Percentage,Status\n";
+
+      let count = 0;
+      classStudents.forEach(s => {
+        const validLecs = classLectures.filter(l => l.batch === 'Full' || l.batch === s.batch);
+        const total = validLecs.length;
+        if(total === 0) return;
+        const validIds = validLecs.map(l => l.id);
+        const atts = window.state.attendance.filter(a => String(a.moodleId) === String(s.moodleId) && validIds.includes(a.lectureId)).length;
+        const pct = Math.min(100, Math.round((atts / total) * 100));
+
+        if(pct < 75) {
+          csv += `"${s.rollNo || ''}","${s.moodleId}","${s.email || (s.moodleId+'@apsit.edu.in')}","${s.name}","${s.department}","${s.year}","${s.division}","${s.batch}",${total},${atts},${pct}%,"DEFAULTER"\n`;
+          count++;
+        }
+      });
+
+      if(count === 0) return window.showToast("No defaulters found in this class!", "info");
+
+      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+      a.download = `Defaulters_${year}_Div_${div}_${new Date().toISOString().split('T')[0]}.csv`; a.click();
+      window.showToast(`Exported ${count} defaulters successfully!`);
+    };
+
+    window.triggerLowAttendanceEmailAlerts = function() {
+      let dept = document.getElementById('rpt-filter-dept')?.value || '';
+      let year = document.getElementById('rpt-filter-year')?.value || 'SE';
+      let div = document.getElementById('rpt-filter-div')?.value || 'A';
+      const fromDate = document.getElementById('rpt-filter-from')?.value || '';
+      const toDate = document.getElementById('rpt-filter-to')?.value || '';
+
+      const coordAssignment = window.state.coordinators.find(c => c.username === window.state.currentUser.username);
+      if(window.state.currentUser.role === 'FACULTY' && coordAssignment) {
+        dept = coordAssignment.dept;
+        year = coordAssignment.year;
+        div = coordAssignment.division;
+      }
+
+      const classStudents = window.state.students.filter(s => s.year === year && s.division === div && (!dept || s.department === dept));
+      
+      let classLectures = window.state.lectures.filter(l => l.year === year && l.division === div && (!dept || l.department === dept));
+      if (fromDate) classLectures = classLectures.filter(l => l.date >= fromDate);
+      if (toDate) classLectures = classLectures.filter(l => l.date <= toDate);
+
+      if(classStudents.length === 0) return window.showToast("No students found in this class.", "error");
+
+      const defaulterEmails = [];
+
+      classStudents.forEach(s => {
+        const validLecs = classLectures.filter(l => l.batch === 'Full' || l.batch === s.batch);
+        const total = validLecs.length;
+        if(total === 0) return;
+
+        const validIds = validLecs.map(l => l.id);
+        const atts = window.state.attendance.filter(a => String(a.moodleId) === String(s.moodleId) && validIds.includes(a.lectureId)).length;
+        const pct = Math.min(100, Math.round((atts / total) * 100));
+
+        if(pct < 75) {
+          defaulterEmails.push(s.email || `${s.moodleId}@apsit.edu.in`);
+        }
+      });
+
+      if(defaulterEmails.length === 0) {
+        return window.showToast("Great news! All students in this class have attendance >= 75%.");
+      }
+
+      const subject = encodeURIComponent(`URGENT: Low Attendance Warning - ${year} Div ${div}`);
+      const body = encodeURIComponent(`Dear Student,\n\nYour attendance for ${year} Division ${div} is currently below the required 75% threshold. Please meet your HOD/Class Teacher immediately.\n\nRegards,\nEduScan Attendance System\nAPSIT`);
+      
+      const mailtoUrl = `mailto:${defaulterEmails.join(',')}?subject=${subject}&body=${body}`;
+      window.open(mailtoUrl, '_blank');
+
+      window.showToast(`Triggered email alert to ${defaulterEmails.length} low attendance students!`);
+    };
+
+    window.generateReportTable = function() {
+      let dept = document.getElementById('rpt-filter-dept')?.value || '';
+      let year = document.getElementById('rpt-filter-year')?.value || 'SE';
+      let div = document.getElementById('rpt-filter-div')?.value || 'A';
+      const fromDate = document.getElementById('rpt-filter-from')?.value || '';
+      const toDate = document.getElementById('rpt-filter-to')?.value || '';
+
+      const coordAssignment = window.state.coordinators.find(c => c.username === window.state.currentUser.username);
+      if(window.state.currentUser.role === 'FACULTY' && coordAssignment) {
+        dept = coordAssignment.dept;
+        year = coordAssignment.year;
+        div = coordAssignment.division;
+      }
+
+      const container = document.getElementById('report-table-container');
+      const cardsContainer = document.getElementById('defaulter-summary-cards');
+      if (!container) return;
+
+      const btnTheory = document.getElementById('btn-report-theory');
+      const btnLab = document.getElementById('btn-report-lab');
+      if(btnTheory && btnLab) {
+        btnTheory.className = `px-5 py-2 rounded-lg text-xs font-bold transition ${window.currentReportType === 'Theory' ? 'bg-indigo-600 text-white shadow-xs' : 'text-slate-600'}`;
+        btnLab.className = `px-5 py-2 rounded-lg text-xs font-bold transition ${window.currentReportType === 'Lab' ? 'bg-indigo-600 text-white shadow-xs' : 'text-slate-600'}`;
+      }
+
+      let classStudents = window.state.students.filter(s => s.year === year && s.division === div && (!dept || s.department === dept));
+      classStudents.sort((a, b) => Number(a.rollNo || 9999) - Number(b.rollNo || 9999));
+
+      let classLectures = window.state.lectures.filter(l => l.year === year && l.division === div && (!dept || l.department === dept));
+      if (fromDate) classLectures = classLectures.filter(l => l.date >= fromDate);
+      if (toDate) classLectures = classLectures.filter(l => l.date <= toDate);
+
+      let defaulterCount = 0;
+      let eligibleCount = 0;
+
+      classStudents.forEach(s => {
+        const validLecs = classLectures.filter(l => l.batch === 'Full' || l.batch === s.batch);
+        if(validLecs.length === 0) { eligibleCount++; return; }
+        const validIds = validLecs.map(l => l.id);
+        const atts = window.state.attendance.filter(a => String(a.moodleId) === String(s.moodleId) && validIds.includes(a.lectureId)).length;
+        const pct = Math.min(100, Math.round((atts / validLecs.length) * 100));
+        if(pct < 75) defaulterCount++; else eligibleCount++;
+      });
+
+      if(cardsContainer) {
+        cardsContainer.innerHTML = `
+          <div class="bg-white p-5 rounded-2xl border text-center shadow-xs">
+            <span class="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Class Enrolled</span>
+            <p class="text-3xl font-black text-slate-900 mt-1">${classStudents.length}</p>
+            <p class="text-[10px] text-slate-500 font-semibold mt-0.5">${year} - Div ${div}</p>
+          </div>
+          <div class="bg-white p-5 rounded-2xl border text-center shadow-xs">
+            <span class="text-[10px] text-teal-600 font-bold uppercase tracking-wider">Eligible (≥75%)</span>
+            <p class="text-3xl font-black text-teal-600 mt-1">${eligibleCount}</p>
+            <p class="text-[10px] text-teal-700 font-semibold mt-0.5">${Math.round((eligibleCount/(classStudents.length||1))*100)}% of Class</p>
+          </div>
+          <div class="bg-white p-5 rounded-2xl border text-center shadow-xs">
+            <span class="text-[10px] text-rose-500 font-bold uppercase tracking-wider">Defaulters (&lt;75%)</span>
+            <p class="text-3xl font-black text-rose-600 mt-1">${defaulterCount}</p>
+            <p class="text-[10px] text-rose-700 font-semibold mt-0.5">Action Required</p>
+          </div>
+        `;
+      }
+
+      if (classStudents.length === 0) {
+        container.innerHTML = `<div class="p-8 text-center text-slate-400 text-sm">No students found registered for <strong>${year} - Division ${div}</strong>.</div>`;
+        return;
+      }
+
+      const dateWindowLabel = (fromDate || toDate) ? `(From ${fromDate || 'Start'} To ${toDate || 'End'})` : `(All-Time)`;
+
+      if (window.currentReportType === 'Theory') {
+        const theoryLectures = classLectures.filter(l => (l.sessionType || 'Theory') === 'Theory');
+        const subjectsMap = {};
+        theoryLectures.forEach(l => { subjectsMap[l.subject] = (subjectsMap[l.subject] || 0) + 1; });
+        const subjectList = Object.keys(subjectsMap);
+
+        container.innerHTML = `
+          <!-- Print Only Official Header[cite: 1] -->
+          <div class="p-6 bg-white border-b space-y-2 text-center text-slate-800 hidden print:block">
+            <h3 class="font-extrabold text-xs uppercase tracking-wider text-slate-900">PARSHVANATH CHARITABLE TRUST'S</h3>
+            <h2 class="font-black text-xl text-indigo-900">A. P. SHAH INSTITUTE OF TECHNOLOGY</h2>
+            <p class="text-xs font-bold text-slate-600">Department of ${dept || 'Information Technology'} (NBA Accredited)</p>
+            <p class="text-xs font-bold text-slate-800 underline mt-1">Theory Attendance Statistics Report ${dateWindowLabel}</p>
+          </div>
+
+          <div class="p-4 bg-slate-50 border-b flex flex-wrap justify-between items-center text-xs text-slate-700">
+            <div>Class-Div: <strong class="text-indigo-900">${year}IT-${div}</strong> | Theory Attendance Statistics <span class="text-indigo-600 font-bold ml-1">${dateWindowLabel}</span></div>
+            <div>Total Conducted Theory Sessions: <strong>${theoryLectures.length}</strong></div>
+          </div>
+
+          <table class="w-full text-left text-[11px] border-collapse">
+            <thead class="bg-slate-100 border-b font-bold text-slate-700 uppercase tracking-wider">
+              <tr>
+                <th class="px-3 py-3 border-r w-12 text-center">Roll No</th>
+                <th class="px-3 py-3 border-r font-mono">Student ID</th>
+                <th class="px-4 py-3 border-r min-w-[180px]">Name of Student</th>
+                
+                ${subjectList.map(subj => `
+                  <th class="px-2 py-2 text-center border-r bg-blue-50/50">
+                    <div class="font-bold text-indigo-900">${subj}</div>
+                    <div class="flex justify-around border-t border-slate-200 mt-1 pt-1 text-[9px] text-slate-600">
+                      <span>${subjectsMap[subj]}</span><span>%</span>
+                    </div>
+                  </th>
+                `).join('')}
+
+                <th class="px-3 py-3 text-center border-r bg-slate-200/50 font-black">Overall Attendance %</th>
+                <th class="px-3 py-3 text-center border-r bg-slate-200/50 font-black">Overall Practical %</th>
+                <th class="px-3 py-3 text-right bg-indigo-100 text-indigo-950 font-black">Average %</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-200">
+              ${classStudents.map(s => {
+                let totalAttended = 0;
+                let totalConducted = 0;
+
+                const subjectCells = subjectList.map(subj => {
+                  const subjLecIds = theoryLectures.filter(l => l.subject === subj && (l.batch === 'Full' || l.batch === s.batch)).map(l => l.id);
+                  const conductedCount = theoryLectures.filter(l => l.subject === subj && (l.batch === 'Full' || l.batch === s.batch)).length;
+                  const attendedCount = window.state.attendance.filter(a => String(a.moodleId) === String(s.moodleId) && subjLecIds.includes(a.lectureId)).length;
+                  
+                  totalAttended += attendedCount;
+                  totalConducted += conductedCount;
+                  
+                  const pct = conductedCount > 0 ? Math.min(100, Math.round((attendedCount / conductedCount) * 100)) : 100;
+                  return `
+                    <td class="px-2 py-2 text-center border-r bg-blue-50/10 font-mono">
+                      <div class="flex justify-around font-semibold">
+                        <span>${attendedCount}</span>
+                        <span class="font-bold ${pct >= 75 ? 'text-teal-700' : 'text-rose-600'}">${pct}%</span>
+                      </div>
+                    </td>
+                  `;
+                }).join('');
+
+                const labLectures = classLectures.filter(l => l.sessionType === 'Lab' && (l.batch === 'Full' || l.batch === s.batch));
+                const labAttended = window.state.attendance.filter(a => String(a.moodleId) === String(s.moodleId) && labLectures.map(l => l.id).includes(a.lectureId)).length;
+                const labPct = labLectures.length > 0 ? Math.round((labAttended / labLectures.length) * 100) : 100;
+
+                const overallTheoryPct = totalConducted > 0 ? Math.round((totalAttended / totalConducted) * 100) : 100;
+                const avgPct = Math.round((overallTheoryPct + labPct) / 2);
+
+                return `
+                  <tr class="hover:bg-slate-50 border-b">
+                    <td class="px-3 py-2.5 font-bold text-indigo-700 border-r text-center">#${s.rollNo || '-'}</td>
+                    <td class="px-3 py-2.5 font-mono font-semibold border-r">${s.moodleId}</td>
+                    <td class="px-4 py-2.5 font-bold text-slate-900 border-r">${s.name}</td>
+                    ${subjectCells}
+                    <td class="px-3 py-2.5 text-center font-bold border-r ${overallTheoryPct >= 75 ? 'text-teal-700 bg-teal-50/20' : 'text-rose-600 bg-rose-50/20'}">${overallTheoryPct}%</td>
+                    <td class="px-3 py-2.5 text-center font-bold border-r ${labPct >= 75 ? 'text-teal-700 bg-teal-50/20' : 'text-rose-600 bg-rose-50/20'}">${labPct}%</td>
+                    <td class="px-3 py-2.5 text-right font-black ${avgPct >= 75 ? 'text-teal-800 bg-teal-100/40' : 'text-rose-800 bg-rose-100/40'}">${avgPct}%</td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+
+          <div class="p-8 bg-slate-50 border-t flex justify-between items-center text-xs font-bold text-slate-700">
+            <div>Class Coordinator</div>
+            <div>Class In Charge</div>
+            <div>HOD, ${dept || 'Information Technology Department'} | APSIT</div>
+          </div>
+        `;
+      } else {
+        const labLectures = classLectures.filter(l => l.sessionType === 'Lab');
+        const subjectsMap = {};
+        labLectures.forEach(l => { subjectsMap[l.subject] = (subjectsMap[l.subject] || 0) + 1; });
+        const subjectList = Object.keys(subjectsMap);
+
+        container.innerHTML = `
+          <!-- Print Only Official Header[cite: 1] -->
+          <div class="p-6 bg-white border-b space-y-2 text-center text-slate-800 hidden print:block">
+            <h3 class="font-extrabold text-xs uppercase tracking-wider text-slate-900">PARSHVANATH CHARITABLE TRUST'S</h3>
+            <h2 class="font-black text-xl text-indigo-900">A. P. SHAH INSTITUTE OF TECHNOLOGY</h2>
+            <p class="text-xs font-bold text-slate-600">Department of ${dept || 'Information Technology'} (NBA Accredited)</p>
+            <p class="text-xs font-bold text-slate-800 underline mt-1">Lab Attendance Statistics Report ${dateWindowLabel}</p>
+          </div>
+
+          <div class="p-4 bg-slate-50 border-b flex flex-wrap justify-between items-center text-xs text-slate-700">
+            <div>Class-Div: <strong class="text-indigo-900">${year}IT-${div}</strong> | Lab Attendance Statistics Report <span class="text-indigo-600 font-bold ml-1">${dateWindowLabel}</span></div>
+            <div>Total Conducted Lab Sessions: <strong>${labLectures.length}</strong></div>
+          </div>
+
+          <table class="w-full text-left text-[11px] border-collapse">
+            <thead class="bg-slate-100 border-b font-bold text-slate-700 uppercase tracking-wider">
+              <tr>
+                <th class="px-3 py-3 border-r w-12 text-center">SR No.</th>
+                <th class="px-3 py-3 border-r font-mono">Student ID</th>
+                <th class="px-4 py-3 border-r min-w-[180px]">Name of Student</th>
+                
+                ${subjectList.map(subj => `
+                  <th class="px-2 py-2 text-center border-r bg-purple-50/50">
+                    <div class="font-bold text-purple-900">${subj}</div>
+                    <div class="flex justify-around border-t border-slate-200 mt-1 pt-1 text-[9px] text-slate-600">
+                      <span>${subjectsMap[subj]}</span><span>%</span>
+                    </div>
+                  </th>
+                `).join('')}
+
+                <th class="px-3 py-3 text-right bg-purple-100 text-purple-950 font-black">Overall Lab Attendance %</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-200">
+              ${classStudents.map((s, index) => {
+                let totalLabAttended = 0;
+                let totalLabConducted = 0;
+
+                const subjectCells = subjectList.map(subj => {
+                  const subjLecIds = labLectures.filter(l => l.subject === subj && (l.batch === 'Full' || l.batch === s.batch)).map(l => l.id);
+                  const conductedCount = labLectures.filter(l => l.subject === subj && (l.batch === 'Full' || l.batch === s.batch)).length;
+                  const attendedCount = window.state.attendance.filter(a => String(a.moodleId) === String(s.moodleId) && subjLecIds.includes(a.lectureId)).length;
+                  
+                  totalLabAttended += attendedCount;
+                  totalLabConducted += conductedCount;
+                  
+                  const pct = conductedCount > 0 ? Math.min(100, Math.round((attendedCount / conductedCount) * 100)) : 100;
+                  return `
+                    <td class="px-2 py-2 text-center border-r bg-purple-50/10 font-mono">
+                      <div class="flex justify-around font-semibold">
+                        <span>${attendedCount}</span>
+                        <span class="font-bold ${pct >= 75 ? 'text-teal-700' : 'text-rose-600'}">${pct}%</span>
+                      </div>
+                    </td>
+                  `;
+                }).join('');
+
+                const overallLabPct = totalLabConducted > 0 ? Math.round((totalLabAttended / totalLabConducted) * 100) : 100;
+
+                return `
+                  <tr class="hover:bg-slate-50 border-b">
+                    <td class="px-3 py-2.5 font-bold text-slate-600 border-r text-center">${index + 1}</td>
+                    <td class="px-3 py-2.5 font-mono font-semibold border-r">${s.moodleId}</td>
+                    <td class="px-4 py-2.5 font-bold text-slate-900 border-r">${s.name} <span class="text-[10px] text-slate-400 font-normal">(${s.batch})</span></td>
+                    ${subjectCells}
+                    <td class="px-3 py-2.5 text-right font-black ${overallLabPct >= 75 ? 'text-teal-800 bg-teal-100/40' : 'text-rose-800 bg-rose-100/40'}">${overallLabPct}%</td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+
+          <div class="p-8 bg-slate-50 border-t flex justify-between items-center text-xs font-bold text-slate-700">
+            <div>Class Coordinator</div>
+            <div>Class In Charge</div>
+            <div>HOD, ${dept || 'Information Technology Department'} | APSIT</div>
+          </div>
+        `;
+      }
+    };
+
+    window.exportFullReport = function() {
+      let csv = "Roll No,Moodle ID,Email,Name,Department,Year,Division,Batch,Total Lectures Conducted,Lectures Attended,Percentage\n";
+      let sorted = [...window.state.students].sort((a,b) => Number(a.rollNo||9999) - Number(b.rollNo||9999));
+      sorted.forEach(s => {
+        const stats = window.computeStudentStats(s.moodleId);
+        csv += `"${s.rollNo || ''}","${s.moodleId}","${s.email || (s.moodleId+'@apsit.edu.in')}","${s.name}","${s.department}","${s.year}","${s.division}","${s.batch}",${stats.total},${stats.attended},${stats.pct}%\n`;
+      });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+      a.download = `Attendance_Report_${new Date().toISOString().split('T')[0]}.csv`; a.click();
+    };
+
+    // --- 5. DEDICATED COORDINATORS TAB ---
+    window.renderCoordinatorsView = function(c) {
+      const facultyUsers = window.state.users.filter(u => u.role === 'FACULTY');
+
+      c.innerHTML = `
+        <div class="space-y-6 max-w-4xl mx-auto">
+          <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
+            <h2 class="text-2xl font-bold text-indigo-900">🎓 Class Coordinator Management</h2>
+            <p class="text-xs text-slate-500">Assign faculty members to specific divisions as Class Coordinators. Coordinators gain access to view and manage students for their assigned division without restricting their teaching rights in other classes.</p>
+            
+            <form onsubmit="window.handleAssignCoordinator(event)" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-2">
+              <select id="coord-user" class="px-3 py-2 border rounded-xl text-xs font-semibold">
+                <option value="">Select Faculty...</option>
+                ${facultyUsers.map(f => `<option value="${f.username}">${f.name} (${f.username})</option>`).join('')}
+              </select>
+              <select id="coord-dept" class="px-3 py-2 border rounded-xl text-xs">${DEPARTMENTS.map(d => `<option value="${d}">${d}</option>`).join('')}</select>
+              <select id="coord-year" onchange="window.updateDivOptionsForYear('coord-year', 'coord-div')" class="px-3 py-2 border rounded-xl text-xs">${YEARS.map(y => `<option value="${y}">${y}</option>`).join('')}</select>
+              <select id="coord-div" class="px-3 py-2 border rounded-xl text-xs font-bold text-indigo-900 bg-indigo-50"></select>
+              <button type="submit" class="sm:col-span-2 lg:col-span-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-xs shadow-md transition">Assign / Update Class Coordinator</button>
+            </form>
+          </div>
+
+          <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
+            <h3 class="font-bold text-slate-800 border-b pb-2">Active Class Coordinators</h3>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+               ${window.state.coordinators.map(coord => {
+                 const fac = window.state.users.find(u => u.username === coord.username);
+                 return `
+                  <div class="p-4 bg-indigo-50/50 border border-indigo-100 rounded-2xl flex justify-between items-center">
+                    <div>
+                      <p class="font-extrabold text-indigo-950">${fac ? fac.name : coord.username}</p> 
+                      <p class="text-xs text-indigo-700 font-bold mt-0.5">${coord.year} Div ${coord.division} &bull; ${coord.dept}</p>
+                    </div>
+                    <button onclick="window.removeCoordinator('${coord.id}')" class="text-rose-600 font-bold hover:bg-rose-100 px-3 py-1.5 rounded-xl text-xs border border-rose-200 bg-white shadow-2xs">Remove</button>
+                  </div>
+                 `;
+               }).join('')}
+               ${window.state.coordinators.length === 0 ? '<p class="text-xs text-slate-400 col-span-full text-center py-4">No class coordinators assigned currently.</p>' : ''}
+            </div>
+          </div>
+        </div>
+      `;
+      window.updateDivOptionsForYear('coord-year', 'coord-div');
+    };
+
+    window.handleAssignCoordinator = function(e) {
+      e.preventDefault();
+      const username = document.getElementById('coord-user').value;
+      const dept = document.getElementById('coord-dept').value;
+      const year = document.getElementById('coord-year').value;
+      const division = document.getElementById('coord-div').value;
+
+      if(!username) return window.showToast("Select a faculty member", "error");
+
+      window.state.coordinators = window.state.coordinators.filter(c => c.username !== username);
+      window.state.coordinators.push({ id: 'coord_'+Date.now(), username, dept, year, division });
+
+      window.saveStateLocalAndCloud();
+      window.switchTab('coordinators');
+      window.showToast("Class coordinator assigned successfully!");
+    };
+
+    window.removeCoordinator = function(id) {
+      if(confirm("Remove this coordinator assignment?")) {
+        window.state.coordinators = window.state.coordinators.filter(c => c.id !== id);
+        window.saveStateLocalAndCloud();
+        window.switchTab('coordinators');
+      }
+    };
+
+    // --- 6. SETTINGS ---
+    window.renderSettingsView = function(c) {
+      const isAdminOrHod = (window.state.currentUser.role === 'ADMIN' || window.state.currentUser.role === 'HOD');
+
+      c.innerHTML = `
+        <div class="space-y-6 max-w-2xl mx-auto">
+          <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
+            <h3 class="font-bold text-lg">My Account</h3>
+            <p class="text-sm">Logged in as <strong>${window.state.currentUser.name}</strong> (${window.state.currentUser.role})</p>
+            <button onclick="window.promptChangePassword()" class="px-4 py-2 bg-slate-800 text-white font-bold rounded-xl text-sm">Change My Password</button>
+          </div>
+          
+          ${isAdminOrHod ? `
+          <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
+            <h3 class="font-bold text-lg border-b pb-2">User Management (Admin/HOD Only)</h3>
+            <form onsubmit="window.handleCreateUser(event)" class="grid grid-cols-1 sm:grid-cols-2 gap-3 pb-4 border-b">
+              <input id="u-name" type="text" placeholder="Full Name" required class="px-3 py-2 border rounded-xl text-sm" />
+              <input id="u-user" type="text" placeholder="Username" required class="px-3 py-2 border rounded-xl text-sm font-mono" />
+              <input id="u-pass" type="text" placeholder="Password" required class="px-3 py-2 border rounded-xl text-sm" />
+              <select id="u-role" class="px-3 py-2 border rounded-xl text-sm">
+                <option value="FACULTY">FACULTY</option>
+                <option value="HOD">HOD</option>
+                <option value="ADMIN">ADMIN</option>
+                <option value="VIEW_ONLY">VIEW ONLY</option>
+              </select>
+              <button type="submit" class="sm:col-span-2 py-2 bg-indigo-600 text-white rounded-xl font-bold text-sm">Create Account</button>
+            </form>
+            <div class="space-y-2">
+               ${window.state.users.map(u => `
+                <div class="p-3 bg-slate-50 border rounded-xl flex justify-between items-center text-sm">
+                  <div>
+                    <span class="font-bold">${u.name}</span> 
+                    <span class="text-xs text-slate-500 font-mono ml-1">(${u.username})</span> 
+                    <span class="px-1.5 py-0.5 ml-2 bg-indigo-100 text-indigo-800 text-[10px] rounded font-bold">${u.role}</span>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <button onclick="window.resetStaffPassword('${u.id}')" class="px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded text-xs font-bold transition">🔑 Reset Pass</button>
+                    ${u.username !== window.state.currentUser.username ? `<button onclick="window.deleteUser('${u.id}')" class="text-rose-500 font-bold hover:bg-rose-50 px-2 py-1 rounded">Delete</button>` : ''}
+                  </div>
+                </div>
+               `).join('')}
+            </div>
+          </div>
+          ` : ''}
+        </div>
+      `;
+    };
+
+    window.resetStaffPassword = function(userId) {
+      const user = window.state.users.find(u => u.id === userId);
+      if(!user) return;
+      const newPass = prompt(`Reset password for user ${user.name} (${user.username}):`, "123456");
+      if(newPass) {
+        user.password = newPass;
+        window.saveStateLocalAndCloud();
+        window.showToast(`Password for ${user.name} reset to: ${newPass}`);
+      }
+    };
+
+    window.handleCreateUser = function(e) {
+      e.preventDefault();
+      const u = document.getElementById('u-user').value.trim();
+      if(window.state.users.find(x => x.username.toLowerCase() === u.toLowerCase())) return window.showToast("Username exists", "error");
+      window.state.users.push({ id: 'usr_'+Date.now(), username: u, name: document.getElementById('u-name').value, password: document.getElementById('u-pass').value, role: document.getElementById('u-role').value });
+      window.saveStateLocalAndCloud(); window.switchTab('settings'); window.showToast("User created.");
+    };
+
+    window.deleteUser = function(id) {
+      if(confirm("Delete this user account?")) { window.state.users = window.state.users.filter(x => x.id !== id); window.saveStateLocalAndCloud(); window.switchTab('settings'); }
+    };
+
+    // --- LOGIN MODAL ---
+    window.openLoginModal = function() {
+      const c = window.getModalContainer();
+      c.innerHTML = `
+        <div class="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
+          <div class="bg-white rounded-3xl max-w-sm w-full p-8 shadow-2xl space-y-6">
+            <div class="text-center">
+              <div class="w-12 h-12 bg-indigo-600 text-white rounded-xl flex items-center justify-center mx-auto mb-4 shadow-md"><svg class="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6-1v2M6 4v2M4 8h16M4 16h16M6 20v-2m12 2v-2m-6 2v-1M8 12h8" /></svg></div>
+              <h3 class="font-black text-2xl text-slate-900">EduScan Login</h3>
+              <p class="text-xs text-slate-500 mt-2">Enter credentials manually to continue</p>
+            </div>
+            <form onsubmit="window.handleLoginSubmit(event)" class="space-y-4">
+              <input id="login-username" type="text" placeholder="Username / Moodle ID" required class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-medium" />
+              <input id="login-password" type="password" placeholder="Password" required class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-medium" />
+              <button type="submit" class="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-bold shadow-md transition-all">Secure Log In</button>
+            </form>
+          </div>
+        </div>
+      `;
+    };
+
+    window.handleLoginSubmit = function(e) {
+      e.preventDefault();
+      const uname = document.getElementById('login-username').value.trim();
+      const pass = document.getElementById('login-password').value.trim();
+
+      const student = window.state.students.find(s => String(s.moodleId) === uname);
+      if (student && pass === (student.password || '123456')) {
+        window.state.currentUser = { role: 'STUDENT', username: student.moodleId, name: student.name };
+        window.finishLogin(student.name, 'portal'); return;
+      }
+      const user = window.state.users.find(u => u.username.toLowerCase() === uname.toLowerCase() && u.password === pass);
+      if (user) { window.state.currentUser = user; window.finishLogin(user.name, 'lectures'); return; }
+      window.showToast("Invalid credentials.", "error");
+    };
+
+    window.finishLogin = function(name, tab) {
+      window.saveStateLocalAndCloud(); window.closeModal(); window.showToast(`Welcome back, ${name}!`);
+      window.state.activeTab = tab; renderMainContent();
+    };
+
+    window.renderMainContent();
+  </script>
+</body>
+</html>
